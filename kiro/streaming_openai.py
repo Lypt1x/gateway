@@ -37,7 +37,12 @@ import httpx
 from fastapi import HTTPException
 from loguru import logger
 
-from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
+from kiro.parsers import (
+    parse_bracket_tool_calls,
+    deduplicate_tool_calls,
+    get_stream_stop_reason,
+    reset_stream_stop_reason,
+)
 from kiro.utils import generate_completion_id
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
@@ -58,7 +63,9 @@ from kiro.streaming_core import (
 from kiro.network_errors import (
     TRANSPORT_DROP_EXCEPTIONS,
     MIDSTREAM_CLOSEOUT_EXCEPTIONS,
+    CONTENT_FILTER_NOTICE,
     UpstreamStreamException,
+    is_content_filter_stop_reason,
     is_transport_drop_error,
     should_closeout_midstream,
     describe_transport_drop,
@@ -139,6 +146,9 @@ async def stream_kiro_to_openai_internal(
     # True while thinking/reasoning content is being emitted and no regular content
     # has followed it yet. No continuation may be attempted from inside it.
     thinking_active = False
+    
+    # A new turn starts with no upstream stop reason recorded.
+    reset_stream_stop_reason()
     
     try:
         # Use streaming_core.parse_kiro_stream for unified event parsing
@@ -289,13 +299,28 @@ async def stream_kiro_to_openai_internal(
         received_context_usage = context_usage_percentage is not None
         stream_completed_normally = received_usage or received_context_usage
         
+        # Upstream content-policy block (metadataEvent.stopReason). Recorded by the
+        # parser, read here. Logged ONCE at WARNING with the stop reason only -
+        # never the request or response text, which is by definition sensitive.
+        upstream_stop_reason = get_stream_stop_reason()
+        content_filtered = is_content_filter_stop_reason(upstream_stop_reason)
+        if content_filtered:
+            logger.warning(
+                f"Upstream blocked the response by content policy "
+                f"(stopReason={upstream_stop_reason})"
+            )
+        
         # Check bracket-style tool calls in full content
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
         all_tool_calls = tool_calls_from_stream + bracket_tool_calls
         all_tool_calls = deduplicate_tool_calls(all_tool_calls)
         
-        # Detect content truncation (missing completion signals)
+        # Detect content truncation (missing completion signals).
+        # A content-filtered turn is EXCLUDED: it legitimately ends short, and
+        # reporting it as truncation would both mislead the client and inject a
+        # bogus recovery notice into the next turn.
         content_was_truncated = (
+            not content_filtered and
             not stream_completed_normally and
             len(full_content) > 0 and
             not all_tool_calls  # Don't confuse with tool call truncation
@@ -309,8 +334,28 @@ async def stream_kiro_to_openai_internal(
                 f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
             )
         
-        # Determine finish_reason (truncation has highest priority)
-        if content_was_truncated:
+        # A block that produced nothing at all must still say something, otherwise
+        # the client renders an empty turn (the reported OpenCode symptom).
+        if content_filtered and not full_content and not full_thinking_content and not all_tool_calls:
+            delta = {"content": CONTENT_FILTER_NOTICE}
+            if first_chunk:
+                delta["role"] = "assistant"
+                first_chunk = False
+            notice_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+            }
+            full_content += CONTENT_FILTER_NOTICE
+            yield f"data: {json.dumps(notice_chunk, ensure_ascii=False)}\n\n"
+        
+        # Determine finish_reason (content filtering outranks truncation)
+        if content_filtered:
+            # Standard OpenAI value, so existing clients render it without changes.
+            finish_reason = "content_filter"
+        elif content_was_truncated:
             finish_reason = "length"
         elif all_tool_calls:
             finish_reason = "tool_calls"

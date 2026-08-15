@@ -128,6 +128,61 @@ INVALID_STATE_EVENT_TYPES: Tuple[str, ...] = (
     "invalid_state_event",
 )
 
+# ==================================================================================================
+# Content-policy blocks (metadataEvent.stopReason)
+# ==================================================================================================
+#
+# Upstream signals the outcome of a turn with a `metadataEvent` frame carrying
+# `{"stopReason": "<VALUE>"}`. Observed / known values: END_TURN, MAX_TOKENS,
+# TOOL_USE and the content-policy blocks below. A blocked turn usually carries
+# little or no content, so without this mapping the client sees an EMPTY turn
+# with no error at all.
+#
+# THIS is the single auditable, extendable set of recognised values. Matching is
+# done through :func:`is_content_filter_stop_reason`, which normalises case and
+# separators, so "CONTENT_FILTERED", "content_filter" and "ContentFiltered" all
+# match without needing separate entries.
+CONTENT_FILTER_STOP_REASONS: Tuple[str, ...] = (
+    "CONTENT_FILTERED",
+    "CONTENT_FILTER",
+    "CONTENT_FILTERING",
+    "CONTENT_POLICY",
+    "CONTENT_POLICY_VIOLATION",
+)
+
+# Neutral, factual notice shown when a block leaves the turn with no content.
+# Deliberately says nothing about which rule fired and never echoes the prompt.
+CONTENT_FILTER_NOTICE: str = (
+    "The upstream provider blocked this response by its content policy, "
+    "so no answer was returned for this turn."
+)
+
+# Normalised lookup: lowercase, separators stripped.
+_CONTENT_FILTER_STOP_REASONS_NORMALISED = frozenset(
+    "".join(ch for ch in value.lower() if ch.isalnum())
+    for value in CONTENT_FILTER_STOP_REASONS
+)
+
+
+def is_content_filter_stop_reason(stop_reason: Optional[str]) -> bool:
+    """
+    True when an upstream ``metadataEvent.stopReason`` means "blocked by content policy".
+
+    Matching is case-insensitive and tolerant of separator variants
+    (``CONTENT_FILTERED``, ``content-filter``, ``contentFiltered``, ...).
+
+    Args:
+        stop_reason: Raw upstream stop reason, or None when none was seen.
+
+    Returns:
+        True for a recognised content-policy block, False otherwise (including None).
+    """
+    if not stop_reason or not isinstance(stop_reason, str):
+        return False
+    normalised = "".join(ch for ch in stop_reason.lower() if ch.isalnum())
+    return normalised in _CONTENT_FILTER_STOP_REASONS_NORMALISED
+
+
 # Exception-type name fragments that map to a rate-limit / 429 signal.
 _THROTTLING_MARKERS: Tuple[str, ...] = (
     "throttl",              # ThrottlingError, ThrottlingException

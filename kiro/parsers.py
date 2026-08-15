@@ -29,11 +29,46 @@ Contains classes and functions for:
 
 import json
 import re
+from contextvars import ContextVar
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
 from kiro.utils import generate_tool_call_id
+
+
+# ==================================================================================================
+# Per-turn upstream stop reason (metadataEvent.stopReason)
+# ==================================================================================================
+#
+# The routing parser already records the last `stopReason` on itself
+# (:attr:`EventStreamRoutingParser.last_stop_reason`), but the parser instance is
+# created inside ``streaming_core.parse_kiro_stream`` and never handed to the
+# dialect formatters, so the value used to be recorded and then discarded.
+#
+# This ContextVar is that missing accessor: the parser records the value, and the
+# dialect layer (streaming_openai / streaming_anthropic) reads it after the stream
+# ends. A ContextVar - not a module global - so concurrent requests, which run in
+# separate asyncio tasks with their own copied context, cannot see each other's
+# value. Callers reset it at the start of a turn.
+_STREAM_STOP_REASON: ContextVar[Optional[str]] = ContextVar(
+    "kiro_stream_stop_reason", default=None
+)
+
+
+def record_stream_stop_reason(stop_reason: Optional[str]) -> None:
+    """Records the upstream stop reason for the current turn."""
+    _STREAM_STOP_REASON.set(stop_reason)
+
+
+def get_stream_stop_reason() -> Optional[str]:
+    """Returns the last upstream stop reason seen in the current turn (or None)."""
+    return _STREAM_STOP_REASON.get()
+
+
+def reset_stream_stop_reason() -> None:
+    """Clears the stop reason. Called by the dialect layer before a turn starts."""
+    _STREAM_STOP_REASON.set(None)
 
 
 def find_matching_brace(text: str, start_pos: int) -> int:
@@ -1011,6 +1046,9 @@ class EventStreamRoutingParser:
             })
         if data.get("stopReason"):
             self.last_stop_reason = data["stopReason"]
+            # Also published on the per-turn ContextVar so the dialect formatters
+            # (which never see this parser instance) can act on it.
+            record_stream_stop_reason(data["stopReason"])
 
         if not events:
             # conversationId / messageId and friends. Ignored downstream today;

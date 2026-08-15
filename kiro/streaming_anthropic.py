@@ -52,14 +52,21 @@ from kiro.streaming_core import (
 from kiro.network_errors import (
     TRANSPORT_DROP_EXCEPTIONS,
     MIDSTREAM_CLOSEOUT_EXCEPTIONS,
+    CONTENT_FILTER_NOTICE,
     UpstreamStreamException,
+    is_content_filter_stop_reason,
     is_transport_drop_error,
     should_closeout_midstream,
     describe_transport_drop,
     describe_midstream_failure,
 )
 from kiro.tokenizer import count_tokens, estimate_request_tokens
-from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
+from kiro.parsers import (
+    parse_bracket_tool_calls,
+    deduplicate_tool_calls,
+    get_stream_stop_reason,
+    reset_stream_stop_reason,
+)
 from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASONING_HANDLING
 
 if TYPE_CHECKING:
@@ -215,6 +222,9 @@ async def stream_kiro_to_anthropic(
     
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
+    
+    # A new turn starts with no upstream stop reason recorded.
+    reset_stream_stop_reason()
     
     try:
         # Send message_start event
@@ -622,9 +632,46 @@ async def stream_kiro_to_anthropic(
                 "type": "content_block_stop",
                 "index": text_block_index
             })
+            text_block_started = False
+            current_block_index += 1
         
-        # Detect content truncation (missing completion signals)
+        # Upstream content-policy block (metadataEvent.stopReason). Logged ONCE at
+        # WARNING with the stop reason only - never request or response text.
+        upstream_stop_reason = get_stream_stop_reason()
+        content_filtered = is_content_filter_stop_reason(upstream_stop_reason)
+        if content_filtered:
+            logger.warning(
+                f"Upstream blocked the response by content policy "
+                f"(stopReason={upstream_stop_reason})"
+            )
+        
+        # A block that produced nothing at all must still say something, otherwise
+        # the client renders an empty turn (the reported OpenCode symptom).
+        if content_filtered and not full_content and not full_thinking_content and not tool_blocks:
+            notice_index = current_block_index
+            yield format_sse_event("content_block_start", {
+                "type": "content_block_start",
+                "index": notice_index,
+                "content_block": {"type": "text", "text": ""}
+            })
+            yield format_sse_event("content_block_delta", {
+                "type": "content_block_delta",
+                "index": notice_index,
+                "delta": {"type": "text_delta", "text": CONTENT_FILTER_NOTICE}
+            })
+            yield format_sse_event("content_block_stop", {
+                "type": "content_block_stop",
+                "index": notice_index
+            })
+            full_content += CONTENT_FILTER_NOTICE
+            current_block_index += 1
+        
+        # Detect content truncation (missing completion signals).
+        # A content-filtered turn is EXCLUDED: it legitimately ends short, and
+        # reporting it as truncation would mislead the client and inject a bogus
+        # recovery notice into the next turn.
         content_was_truncated = (
+            not content_filtered and
             not stream_completed_normally and
             len(full_content) > 0 and
             not tool_blocks  # Don't confuse with tool call truncation
@@ -651,13 +698,31 @@ async def stream_kiro_to_anthropic(
             if prompt_source != "unknown":
                 input_tokens = prompt_tokens
         
-        # Determine stop reason (truncation has highest priority)
-        if content_was_truncated:
+        # Determine stop reason (content filtering outranks truncation, and must
+        # never be "tool_use")
+        if content_filtered:
+            # Anthropic documents "refusal" as a stop_reason for a turn the provider
+            # declined to complete; it is the closest documented value for an
+            # upstream content-policy block.
+            stop_reason = "refusal"
+        elif content_was_truncated:
             stop_reason = "max_tokens"
         elif tool_blocks:
             stop_reason = "tool_use"
         else:
             stop_reason = "end_turn"
+        
+        # An explicit error event so a block cannot be mistaken for a normal short
+        # answer. Emitted BEFORE the single message_delta / message_stop pair, so
+        # the #129 close-out guarantees (exactly one of each) are preserved.
+        if content_filtered:
+            yield format_sse_event("error", {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": CONTENT_FILTER_NOTICE
+                }
+            })
         
         # Send message_delta with stop_reason and usage
         usage_payload = {
@@ -925,8 +990,19 @@ async def collect_anthropic_response(
         input_tokens = request_token_stats["total_tokens"]
     
     # Collect stream result
+    reset_stream_stop_reason()
     result = await collect_stream_to_result(response)
     upstream_cache_usage = _extract_cache_usage_fields(result.usage)
+    
+    # Upstream content-policy block (metadataEvent.stopReason). Logged ONCE at
+    # WARNING with the stop reason only - never request or response text.
+    upstream_stop_reason = get_stream_stop_reason()
+    content_filtered = is_content_filter_stop_reason(upstream_stop_reason)
+    if content_filtered:
+        logger.warning(
+            f"Upstream blocked the response by content policy "
+            f"(stopReason={upstream_stop_reason})"
+        )
     
     # Build content blocks
     content_blocks = []
@@ -970,6 +1046,14 @@ async def collect_anthropic_response(
             "input": tool_input
         })
     
+    # A block that produced nothing at all must still say something explanatory,
+    # otherwise the client receives an empty content array.
+    if content_filtered and not content_blocks:
+        content_blocks.append({
+            "type": "text",
+            "text": CONTENT_FILTER_NOTICE
+        })
+    
     # Calculate output tokens
     output_tokens = count_tokens(result.content + result.thinking_content)
     
@@ -982,9 +1066,11 @@ async def collect_anthropic_response(
         if prompt_source != "unknown":
             input_tokens = prompt_tokens
     
-    # Detect content truncation (missing completion signals)
+    # Detect content truncation (missing completion signals).
+    # A content-filtered turn is EXCLUDED - see the streaming path.
     stream_completed_normally = result.context_usage_percentage is not None
     content_was_truncated = (
+        not content_filtered and
         not stream_completed_normally and
         len(result.content) > 0 and
         not result.tool_calls  # Don't confuse with tool call truncation
@@ -998,8 +1084,10 @@ async def collect_anthropic_response(
             f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
         )
     
-    # Determine stop reason (truncation has highest priority)
-    if content_was_truncated:
+    # Determine stop reason (content filtering outranks truncation)
+    if content_filtered:
+        stop_reason = "refusal"
+    elif content_was_truncated:
         stop_reason = "max_tokens"
     elif result.tool_calls:
         stop_reason = "tool_use"
