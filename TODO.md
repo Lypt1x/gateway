@@ -85,7 +85,9 @@ plain completions worked, and the full agentic tool loop wrote files correctly o
       `reasoning_content` (41 SSE chunks in the same request). Harmless but ineffective, which
       is why `?reasoning=` defaults to false. The correct AI SDK config for surfacing reasoning
       through `@ai-sdk/openai-compatible` is still unknown.
-- [ ] Step 3: the setup / doctor / update wrapper. Now unblocked. `doctor` should diff a
+- [x] Step 3: the setup / doctor / update wrapper — `opencode/opencode_config.py` (stdlib
+      only, dry-run by default, merges `provider.<id>` only; see `opencode/README.md`).
+      Original scope: `doctor` should diff a
       user's existing config against the live catalog and report models they list but cannot
       access, models they are missing, and stale limits. It must MERGE, never overwrite, since
       users keep agents, plugins and MCP config in the same file.

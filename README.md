@@ -168,6 +168,63 @@ claude
 Inline `system` messages, `document` blocks, and non-standard roles are accepted and normalised,
 so clients that deviate from the published Anthropic schema still work.
 
+### OpenCode
+
+OpenCode does not auto-discover models for custom providers, so every model has to be listed
+in its config. The gateway generates that list for you from your account's live catalog:
+
+```bash
+export KIRO_GATEWAY_KEY=pick-your-own-secret
+
+python opencode/opencode_config.py setup --url http://localhost:8000 --write
+```
+
+That merges a `kiro` provider block into `~/.config/opencode/opencode.json` with every model
+your account can reach, including correct context and output limits. Then pick a model:
+
+```bash
+opencode run --model kiro/claude-sonnet-4.5 "Explain this repo" < /dev/null
+```
+
+> [!TIP]
+> `opencode run` hangs if stdin is neither a terminal nor redirected. Add `< /dev/null` when
+> scripting it.
+
+The helper has three subcommands, and `setup`/`update` are dry runs unless you pass `--write`:
+
+| Command | Purpose |
+| --- | --- |
+| `setup` | Merge the provider block into your config |
+| `doctor` | Report drift against the live catalog, changing nothing |
+| `update` | Refresh models and limits only |
+
+`doctor` reports models you list that your account cannot reach, models you are missing, stale
+context/output limits, a wrong `npm` package, a `baseURL` missing `/v1`, and an `apiKey` holding
+a literal secret instead of an `{env:NAME}` reference. It exits `1` when it finds drift, so it
+works in CI. Add `--prune` to `setup` or `update` to also drop models the catalog no longer
+serves.
+
+Useful flags: `--config` for a non-default path, `--provider` to rename the provider block,
+`--base-url` if OpenCode reaches the gateway on a different address (Docker, LAN), and
+`--reasoning` to opt into reasoning fields.
+
+> [!IMPORTANT]
+> Only the `provider.<id>` block is ever touched, and `--write` takes a timestamped backup
+> first, so your agents, plugins, MCP servers and other providers are left alone. Your API key
+> is never written into the config: the generated `{env:KIRO_GATEWAY_KEY}` reference is resolved
+> by OpenCode at runtime.
+
+If you prefer to wire it up by hand, fetch the same document directly:
+
+```bash
+curl -H "Authorization: Bearer $KIRO_GATEWAY_KEY" \
+  http://localhost:8000/integrations/opencode.json
+```
+
+Reasoning is off by default. Enabling it sets `reasoning` plus
+`interleaved.field: reasoning_content`, which the gateway does emit, but OpenCode was observed
+to report zero reasoning tokens for it. It is harmless and currently has no effect.
+
 ### Endpoints
 
 | Method | Path | Purpose |
@@ -175,7 +232,8 @@ so clients that deviate from the published Anthropic schema still work.
 | `POST` | `/v1/chat/completions` | OpenAI chat completions, streaming and non-streaming |
 | `POST` | `/v1/messages` | Anthropic messages, streaming and non-streaming |
 | `POST` | `/v1/messages/count_tokens` | Anthropic token estimation |
-| `GET` | `/v1/models` | Models available to the active account |
+| `GET` | `/v1/models` | Models available to the active account, with limits and rate info |
+| `GET` | `/integrations/opencode.json` | Ready-to-merge OpenCode provider config |
 | `GET` | `/health` | Liveness check |
 | `GET` | `/docs` | Interactive OpenAPI documentation |
 
