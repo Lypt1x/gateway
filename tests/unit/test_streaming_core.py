@@ -928,7 +928,8 @@ class TestCalculateTokensFromContextUsage:
         print(f"Comparing total_tokens: Expected 100, Got {total_tokens}")
         assert total_tokens == 100
         assert prompt_source == "unknown"
-        assert total_source == "tiktoken"
+        # Honest labels: tiktoken was never used for the prompt on this path.
+        assert total_source == "unknown"
         print("✓ Zero percentage handled correctly")
     
     def test_handles_none_percentage(self, mock_model_cache):
@@ -950,7 +951,8 @@ class TestCalculateTokensFromContextUsage:
         print(f"Comparing total_tokens: Expected 100, Got {total_tokens}")
         assert total_tokens == 100
         assert prompt_source == "unknown"
-        assert total_source == "tiktoken"
+        # Honest labels: tiktoken was never used for the prompt on this path.
+        assert total_source == "unknown"
         print("✓ None percentage handled correctly")
     
     def test_prevents_negative_prompt_tokens(self, mock_model_cache):
