@@ -252,6 +252,66 @@ Configuration comes from the `environment` block or an `env_file` in `docker-com
 > `~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro`. If the container cannot read the file, check
 > that it is readable by the container user.
 
+## Running as a background service
+
+On Linux (including WSL with `systemd=true` in `/etc/wsl.conf`) the gateway can run as a
+systemd **user** service, so it starts at boot and is always there for your editor.
+
+Keep the key in a file rather than the unit, so it never lands in your shell history:
+
+```bash
+mkdir -p ~/.config/kiro-gateway ~/.local/share/kiro-gateway
+python3 -c "import secrets,pathlib;p=pathlib.Path.home()/'.config/kiro-gateway/key';p.write_text(secrets.token_urlsafe(32));p.chmod(0o600)"
+
+cat > ~/.config/kiro-gateway/env <<EOF
+PROXY_API_KEY=$(cat ~/.config/kiro-gateway/key)
+SERVER_HOST=127.0.0.1
+SERVER_PORT=8000
+ACCOUNT_SYSTEM=1
+EOF
+chmod 600 ~/.config/kiro-gateway/env
+```
+
+Install and enable the unit:
+
+```bash
+cp service/kiro-gateway.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now kiro-gateway.service
+
+# start at boot without having to log in first
+sudo loginctl enable-linger "$USER"
+```
+
+Check it and read its log:
+
+```bash
+systemctl --user status kiro-gateway.service
+tail -f ~/.local/share/kiro-gateway/service.log
+```
+
+Then point OpenCode at the service, letting it read the key from the same file:
+
+```bash
+python opencode/opencode_config.py setup \
+  --url http://127.0.0.1:8000 \
+  --api-key "$(cat ~/.config/kiro-gateway/key)" \
+  --api-key-placeholder '{file:'"$HOME"'/.config/kiro-gateway/key}' \
+  --write
+```
+
+No environment variable is needed after that: OpenCode resolves the `{file:...}` reference
+itself.
+
+> [!WARNING]
+> Run only **one** gateway instance per credential source. Two instances sharing the same
+> `kiro-cli` SQLite database will both try to rotate the same refresh token, and because AWS
+> SSO OIDC refresh tokens are single-use, one can invalidate the other's credentials. Stop any
+> manually started `python main.py` before enabling the service.
+
+The unit sets `Restart=always`, so a crash is recovered automatically. It binds `127.0.0.1` via
+the env file, which keeps it off your network.
+
 ## Account pooling
 
 Set `ACCOUNT_SYSTEM=true` and list several accounts in `credentials.json`. The gateway keeps one

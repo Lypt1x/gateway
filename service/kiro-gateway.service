@@ -1,0 +1,38 @@
+[Unit]
+# systemd *user* service template. Install to ~/.config/systemd/user/kiro-gateway.service
+#
+# Assumes the repo is at %h/gateway with a virtualenv at .venv. Adjust WorkingDirectory
+# and ExecStart if yours differs. %h expands to your home directory.
+Description=Kiro Gateway (OpenAI/Anthropic proxy for Kiro API)
+After=network-online.target
+Wants=network-online.target
+# Never give up permanently on a crash loop (network often not ready at boot).
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+WorkingDirectory=%h/gateway
+EnvironmentFile=%h/.config/kiro-gateway/env
+ExecStart=%h/gateway/.venv/bin/python main.py
+
+# A cold start refreshes the upstream token, which can be slow.
+TimeoutStartSec=120
+Restart=always
+RestartSec=5
+
+# Cheap hardening. The gateway must read credentials from $HOME and write state beside
+# the code, so the filesystem itself cannot be locked down further.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+StandardOutput=append:%h/.local/share/kiro-gateway/service.log
+StandardError=append:%h/.local/share/kiro-gateway/service.log
+
+[Install]
+WantedBy=default.target
