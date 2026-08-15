@@ -326,6 +326,13 @@ async def _process_events(
                 # No thinking parser - pass through as-is
                 yield KiroEvent(type="content", content=content)
         
+        elif event["type"] == "thinking":
+            # Native reasoning (reasoningContentEvent) already arrives split out
+            # from content, so it bypasses the ThinkingParser and maps straight
+            # onto the existing thinking event the converters consume.
+            if event.get("data"):
+                yield KiroEvent(type="thinking", thinking_content=event["data"])
+
         elif event["type"] == "usage":
             yield KiroEvent(type="usage", usage=event["data"])
         

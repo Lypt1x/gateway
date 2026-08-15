@@ -590,32 +590,62 @@ class AwsEventStreamParser:
 # Real event-stream framing (RECOMMENDATION 1)
 # ==================================================================================================
 
-# Maps the `:event-type` header of a decoded frame onto the internal event
-# vocabulary that `AwsEventStreamParser` already produces, so that every
-# downstream converter (streaming_anthropic, streaming_openai) is unchanged.
+# COMPLETE upstream payload reference (captured from real traffic across six
+# scenarios: plain text, reasoning, tool call, gpt-5.6-terra, qwen3-coder-next,
+# long output). Every frame observed carried `:message-type = event`.
 #
-# Both spellings are listed because the wire has been observed carrying the
-# Smithy camelCase names and the Rust snake_case variants.
+# :event-type              payload keys                       internal event(s)
+# ------------------------ ---------------------------------- ------------------
+# assistantResponseEvent   content   (str, token fragment)    content
+#                          modelId   (str, e.g.              (recorded as
+#                                     "claude-sonnet-4.5")    last_model_id)
+#                          NOTE: Claude emits `<thinking>`    (ThinkingParser
+#                          tags INSIDE `content`.             splits those out)
+# reasoningContentEvent    text      (str, native reasoning)  thinking
+#                          signature (str, opaque blob)       (carried on the
+#                                                             event, never
+#                                                             logged)
+# toolUseEvent             name      (str, tool name)         tool accumulation
+#                          toolUseId (str, identity - repeats  via the legacy
+#                                     in EVERY frame)          FIX-03 handlers;
+#                          input     (str, partial-JSON        results come from
+#                                     fragment)                get_tool_calls()
+#                          stop      (bool, final frame)
+# metadataEvent            stopReason (str, e.g. "END_TURN")  metadata
+#                                                             (+ last_stop_reason)
+# contextUsageEvent        contextUsagePercentage (float)     context_usage
+# meteringEvent            usage       (float, e.g. 0.0453)   usage (numeric,
+#                          unit        (str, "credit")         unchanged shape)
+#                          unitPlural  (str, "credits")       + last_metering
 #
-#   assistantResponseEvent -> content
-#   toolUseEvent           -> tool_start / tool_input / tool_stop (payload-shaped)
-#   messageMetadata        -> usage / context_usage / metadata
-#   followupPrompt         -> followup
+# Anything not listed is surfaced verbatim as "unknown_event" (logged once per
+# unseen `:event-type` at DEBUG), and frames whose `:message-type` is not
+# `event` are surfaced as "exception". See _route_frame for that extension point.
 #
-# Anything not listed here (invalidStateEvent, codeReferenceEvent,
-# reasoningContentEvent, ...) is surfaced verbatim as an "unknown_event", and
-# frames whose `:message-type` is not `event` are surfaced as "exception".
-# See EventStreamRoutingParser._route_frame for that extension point.
+# Alias policy: camelCase names above are REAL (observed on the wire). The
+# snake_case entries are PLAUSIBLE-ONLY variants kept because the Rust client
+# uses snake_case internally; they cost nothing and are marked as such. The
+# previously-listed `messageMetadata` / `messageMetadataEvent` /
+# `message_metadata_event` names were PHANTOMS (no such Smithy member exists)
+# and have been removed.
 FRAME_EVENT_TYPE_MAP: Dict[str, str] = {
+    # --- REAL, observed on the wire ---
     "assistantResponseEvent": "content",
-    "assistant_response_event": "content",
+    "reasoningContentEvent": "reasoning",
     "toolUseEvent": "tool_use",
-    "tool_use_event": "tool_use",
-    "messageMetadata": "metadata",
-    "messageMetadataEvent": "metadata",
-    "message_metadata_event": "metadata",
+    "metadataEvent": "metadata",
+    "contextUsageEvent": "metadata",
+    "meteringEvent": "metadata",
+    # --- REAL but not reproduced in the six captured scenarios ---
     "followupPrompt": "followup",
     "followupPromptEvent": "followup",
+    # --- PLAUSIBLE-ONLY snake_case variants (never observed) ---
+    "assistant_response_event": "content",
+    "reasoning_content_event": "reasoning",
+    "tool_use_event": "tool_use",
+    "metadata_event": "metadata",
+    "context_usage_event": "metadata",
+    "metering_event": "metadata",
     "followup_prompt_event": "followup",
 }
 
@@ -661,6 +691,17 @@ class EventStreamRoutingParser:
         # None = undecided, "framed" / "legacy" once resolved.
         self.mode: Optional[str] = None
         self._logged_mode = False
+
+        # --- additive, retrievable payload surface (no consumer changes) ------
+        # Last `meteringEvent` seen, as {"usage": float, "unit": str,
+        # "unitPlural": str}. Source for a future credit display.
+        self.last_metering: Optional[Dict[str, Any]] = None
+        # Last `metadataEvent.stopReason` (e.g. "END_TURN").
+        self.last_stop_reason: Optional[str] = None
+        # Last `assistantResponseEvent.modelId` (e.g. "claude-sonnet-4.5").
+        self.last_model_id: Optional[str] = None
+        # `:event-type` values already reported as unknown (log-once bookkeeping).
+        self._seen_unknown_event_types: set = set()
 
         if enabled:
             from kiro.eventstream import EventStreamDecoder
@@ -819,6 +860,15 @@ class EventStreamRoutingParser:
 
         # --- unmapped event types --------------------------------------------
         if internal is None:
+            key = event_type or "<missing>"
+            if key not in self._seen_unknown_event_types:
+                self._seen_unknown_event_types.add(key)
+                # DEBUG only, and never the payload: reasoning signatures are
+                # opaque blobs and payloads may contain user text.
+                logger.debug(
+                    f"Kiro stream: unmapped :event-type '{key}' "
+                    "(passed through as unknown_event)"
+                )
             return [{
                 "type": "unknown_event",
                 "data": data,
@@ -833,6 +883,8 @@ class EventStreamRoutingParser:
 
         if internal == "content":
             return self._route_content(data)
+        if internal == "reasoning":
+            return self._route_reasoning(data)
         if internal == "tool_use":
             return self._route_tool_use(data)
         if internal == "metadata":
@@ -856,6 +908,11 @@ class EventStreamRoutingParser:
 
     def _route_content(self, data: dict) -> List[Dict[str, Any]]:
         """assistantResponseEvent -> content (or followup)."""
+        # `modelId` rides along on every frame; keep the last one retrievable.
+        model_id = data.get("modelId")
+        if model_id:
+            self.last_model_id = model_id
+
         # A followup prompt can ride inside an assistant response payload.
         if data.get("followupPrompt"):
             return [{"type": "followup", "data": data["followupPrompt"]}]
@@ -868,6 +925,24 @@ class EventStreamRoutingParser:
         # same JSON twice; framing delivers each payload exactly once, so
         # dropping a legitimately repeated token would lose real output.
         return [{"type": "content", "data": content}]
+
+    def _route_reasoning(self, data: dict) -> List[Dict[str, Any]]:
+        """
+        reasoningContentEvent -> the existing internal ``thinking`` event.
+
+        Non-Claude models (gpt-5.6-terra, ...) emit native reasoning here instead
+        of inlining ``<thinking>`` tags in ``content``. Previously unmapped, so it
+        was dropped. ``signature`` is an opaque upstream blob: it is carried on the
+        event for future consumers and never logged.
+        """
+        text = data.get("text")
+        if not text:
+            return []
+        event: Dict[str, Any] = {"type": "thinking", "data": text}
+        signature = data.get("signature")
+        if signature:
+            event["signature"] = signature
+        return [event]
 
     def _route_tool_use(self, data: dict) -> List[Dict[str, Any]]:
         """
@@ -909,16 +984,33 @@ class EventStreamRoutingParser:
         return []
 
     def _route_metadata(self, data: dict, frame: Any) -> List[Dict[str, Any]]:
-        """messageMetadataEvent -> usage / context_usage / metadata passthrough."""
+        """
+        metadataEvent / contextUsageEvent / meteringEvent -> usage /
+        context_usage / metadata passthrough.
+
+        Additive only: ``usage`` keeps its exact numeric shape, while the credit
+        unit names and the stop reason are recorded on the parser
+        (:attr:`last_metering`, :attr:`last_stop_reason`) for future consumers.
+        """
         events: List[Dict[str, Any]] = []
 
         if "usage" in data:
-            events.append({"type": "usage", "data": data.get("usage", 0)})
+            usage = data.get("usage", 0)
+            # meteringEvent credit fields: preserved so a future credit display
+            # can render "0.0454 credits" without another upstream round trip.
+            self.last_metering = {
+                "usage": usage,
+                "unit": data.get("unit"),
+                "unitPlural": data.get("unitPlural"),
+            }
+            events.append({"type": "usage", "data": usage})
         if "contextUsagePercentage" in data:
             events.append({
                 "type": "context_usage",
                 "data": data.get("contextUsagePercentage", 0),
             })
+        if data.get("stopReason"):
+            self.last_stop_reason = data["stopReason"]
 
         if not events:
             # conversationId / messageId and friends. Ignored downstream today;
@@ -943,6 +1035,10 @@ class EventStreamRoutingParser:
         self._pending_legacy = b""
         self.mode = None
         self._logged_mode = False
+        self.last_metering = None
+        self.last_stop_reason = None
+        self.last_model_id = None
+        self._seen_unknown_event_types = set()
         if self._decoder_enabled:
             from kiro.eventstream import EventStreamDecoder
             self._decoder = EventStreamDecoder()

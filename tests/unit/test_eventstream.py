@@ -323,15 +323,15 @@ class TestFramedRouting:
 
     def test_message_metadata_routes_to_usage_and_context_usage(self):
         """
-        What it does: Feeds messageMetadata frames carrying usage/context usage.
+        What it does: Feeds the real metering/context/metadata frames.
         Goal: 'usage' and 'context_usage' events, plus metadata passthrough.
         """
         parser = EventStreamRoutingParser(enabled=True)
 
         events = parser.feed(
-            event_frame("messageMetadata", {"usage": 7})
-            + event_frame("messageMetadataEvent", {"contextUsagePercentage": 42.5})
-            + event_frame("message_metadata_event", {"conversationId": "c1", "messageId": "m1"})
+            event_frame("meteringEvent", {"usage": 7})
+            + event_frame("contextUsageEvent", {"contextUsagePercentage": 42.5})
+            + event_frame("metadataEvent", {"conversationId": "c1", "messageId": "m1"})
         )
 
         assert {"type": "usage", "data": 7} in events
@@ -671,7 +671,7 @@ class TestStreamingCoreIntegration:
         blob = (
             event_frame("assistantResponseEvent", {"content": "Hello"})
             + event_frame("assistantResponseEvent", {"content": " World"})
-            + event_frame("messageMetadata", {"contextUsagePercentage": 5.0})
+            + event_frame("contextUsageEvent", {"contextUsagePercentage": 5.0})
         )
 
         async def aiter_bytes():
