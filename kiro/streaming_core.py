@@ -410,28 +410,90 @@ def calculate_tokens_from_context_usage(
     context_usage_percentage: Optional[float],
     completion_tokens: int,
     model_cache: "ModelInfoCache",
-    model: str
+    model: str,
+    prompt_messages: Optional[List[Dict[str, Any]]] = None,
+    prompt_tools: Optional[List[Dict[str, Any]]] = None,
+    prompt_text: Optional[str] = None
 ) -> Tuple[int, int, str, str]:
     """
     Calculate token counts from Kiro's context usage percentage.
+    
+    The percentage is inverted against the model's REAL maxInputTokens only. When the
+    limit is not actually known (unknown model, metadata-free static fallback entry, a
+    synthetic alias whose target is unknown), the percentage is NOT inverted against a
+    guessed 200k denominator and presented as authoritative — up to a 5x error, silently
+    labelled "subtraction". Such a turn falls back to estimation instead.
+    
+    Fallback path: prompt tokens are ESTIMATED with kiro.tokenizer from whatever prompt
+    material the caller passes, rather than reported as 0 (a client tracking context
+    from usage.prompt_tokens would see a conversation that never grows). When no prompt
+    material is supplied the legacy sentinel ("unknown", 0) is returned unchanged, which
+    is what the streaming call sites use to run their own, better-informed estimate.
     
     Args:
         context_usage_percentage: Context usage percentage from Kiro API
         completion_tokens: Number of completion tokens (counted via tiktoken)
         model_cache: Model cache for getting max input tokens
         model: Model name
+        prompt_messages: Optional request messages, for fallback estimation
+        prompt_tools: Optional request tools, for fallback estimation
+        prompt_text: Optional raw prompt text, for fallback estimation
     
     Returns:
         Tuple of (prompt_tokens, total_tokens, prompt_source, total_source)
     """
     if context_usage_percentage is not None and context_usage_percentage > 0:
-        max_input_tokens = model_cache.get_max_input_tokens(model)
-        total_tokens = int((context_usage_percentage / 100) * max_input_tokens)
-        prompt_tokens = max(0, total_tokens - completion_tokens)
-        return prompt_tokens, total_tokens, "subtraction", "API Kiro"
+        # Only a measured limit may act as the denominator. Missing method (mocks /
+        # older cache objects) is treated as "known", preserving previous behaviour.
+        try:
+            limit_is_measured = bool(model_cache.has_measured_max_input_tokens(model))
+        except AttributeError:
+            limit_is_measured = True
+        
+        if limit_is_measured:
+            max_input_tokens = model_cache.get_max_input_tokens(model)
+            total_tokens = int((context_usage_percentage / 100) * max_input_tokens)
+            prompt_tokens = max(0, total_tokens - completion_tokens)
+            return prompt_tokens, total_tokens, "subtraction", "API Kiro"
+        
+        logger.debug(
+            f"Context usage percentage present but maxInputTokens unknown for model "
+            f"'{model}'; estimating instead of inverting against a default denominator."
+        )
     
-    # Fallback: no context usage data
-    return 0, completion_tokens, "unknown", "tiktoken"
+    # Fallback: no usable context usage data. Estimate rather than report 0.
+    estimated = _estimate_prompt_tokens(prompt_messages, prompt_tools, prompt_text)
+    if estimated is not None:
+        return estimated, estimated + completion_tokens, "estimate", "estimate"
+    
+    # Nothing to estimate from: keep the sentinel the call sites branch on.
+    return 0, completion_tokens, "unknown", "unknown"
+
+
+def _estimate_prompt_tokens(
+    prompt_messages: Optional[List[Dict[str, Any]]],
+    prompt_tools: Optional[List[Dict[str, Any]]],
+    prompt_text: Optional[str]
+) -> Optional[int]:
+    """
+    Estimate prompt tokens with the existing tokenizer, or None when nothing was given.
+    
+    No Claude correction factor: it was calibrated for completion text, matching how the
+    streaming call sites already estimate prompt tokens.
+    """
+    if not prompt_messages and not prompt_tools and not prompt_text:
+        return None
+    
+    from kiro.tokenizer import count_message_tokens, count_tokens, count_tools_tokens
+    
+    total = 0
+    if prompt_messages:
+        total += count_message_tokens(prompt_messages, apply_claude_correction=False)
+    if prompt_tools:
+        total += count_tools_tokens(prompt_tools, apply_claude_correction=False)
+    if prompt_text:
+        total += count_tokens(prompt_text, apply_claude_correction=False)
+    return total
 
 
 # ==================================================================================================

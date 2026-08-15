@@ -71,6 +71,31 @@ def reset_stream_stop_reason() -> None:
     _STREAM_STOP_REASON.set(None)
 
 
+def log_context_usage_payload_keys(data: dict, already_logged: bool) -> bool:
+    """
+    Log the KEY NAMES of one contextUsageEvent payload once per stream, at DEBUG.
+
+    Names only, never values, so no user content or token figure is ever written.
+    Upstream is currently observed to send only ``contextUsagePercentage``; the binary's
+    model also declares absolute counters (total_tokens, uncached_input_tokens, ...). If
+    those ever start arriving, this line is how we find out instead of guessing.
+
+    Args:
+        data: The parsed contextUsageEvent payload.
+        already_logged: Whether this stream already logged its key set.
+
+    Returns:
+        True if the stream has now logged (pass back as ``already_logged``).
+    """
+    if already_logged:
+        return True
+    if not isinstance(data, dict):
+        return already_logged
+    names = sorted(k for k in data.keys() if isinstance(k, str))
+    logger.debug(f"contextUsageEvent payload keys: {names}")
+    return True
+
+
 def find_matching_brace(text: str, start_pos: int) -> int:
     """
     Finds the position of the closing brace considering nesting and strings.
@@ -289,6 +314,8 @@ class AwsEventStreamParser:
         self.last_content: Optional[str] = None  # For deduplicating repeating content
         self.current_tool_call: Optional[Dict[str, Any]] = None
         self.tool_calls: List[Dict[str, Any]] = []
+        # Log-once bookkeeping for contextUsageEvent key names (names only).
+        self._context_usage_keys_logged = False
     
     def feed(self, chunk: bytes) -> List[Dict[str, Any]]:
         """
@@ -362,6 +389,9 @@ class AwsEventStreamParser:
         elif event_type == 'usage':
             return {"type": "usage", "data": data.get('usage', 0)}
         elif event_type == 'context_usage':
+            self._context_usage_keys_logged = log_context_usage_payload_keys(
+                data, self._context_usage_keys_logged
+            )
             return {"type": "context_usage", "data": data.get('contextUsagePercentage', 0)}
         
         return None
@@ -618,7 +648,7 @@ class AwsEventStreamParser:
         self.last_content = None
         self.current_tool_call = None
         self.tool_calls = []
-
+        self._context_usage_keys_logged = False
 
 
 # ==================================================================================================
@@ -737,6 +767,8 @@ class EventStreamRoutingParser:
         self.last_model_id: Optional[str] = None
         # `:event-type` values already reported as unknown (log-once bookkeeping).
         self._seen_unknown_event_types: set = set()
+        # Log-once bookkeeping for contextUsageEvent key names (names only).
+        self._context_usage_keys_logged = False
 
         if enabled:
             from kiro.eventstream import EventStreamDecoder
@@ -1040,6 +1072,9 @@ class EventStreamRoutingParser:
             }
             events.append({"type": "usage", "data": usage})
         if "contextUsagePercentage" in data:
+            self._context_usage_keys_logged = log_context_usage_payload_keys(
+                data, self._context_usage_keys_logged
+            )
             events.append({
                 "type": "context_usage",
                 "data": data.get("contextUsagePercentage", 0),
@@ -1077,6 +1112,7 @@ class EventStreamRoutingParser:
         self.last_stop_reason = None
         self.last_model_id = None
         self._seen_unknown_event_types = set()
+        self._context_usage_keys_logged = False
         if self._decoder_enabled:
             from kiro.eventstream import EventStreamDecoder
             self._decoder = EventStreamDecoder()

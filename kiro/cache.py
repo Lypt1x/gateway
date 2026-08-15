@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from kiro.config import MODEL_CACHE_TTL, DEFAULT_MAX_INPUT_TOKENS
+from kiro.config import MODEL_CACHE_TTL, DEFAULT_MAX_INPUT_TOKENS, MODEL_ALIASES
 
 
 class ModelInfoCache:
@@ -264,15 +264,92 @@ class ModelInfoCache:
                 "modelId": display_name,
                 "modelName": display_name,
                 "description": f"Hidden model (internal: {internal_id})",
-                "tokenLimits": {"maxInputTokens": DEFAULT_MAX_INPUT_TOKENS},
+                # No "tokenLimits": a synthetic entry has measured nothing, and a
+                # fabricated limit here was indistinguishable from an upstream one
+                # (it silently became the denominator for context-usage inversion).
+                # The local default is kept under a clearly-marked private key so
+                # callers can tell "unknown" from "measured".
+                "_default_max_input_tokens": DEFAULT_MAX_INPUT_TOKENS,
                 "_internal_id": internal_id,  # Store internal ID for reference
                 "_is_hidden": True,  # Mark as hidden model
             }
             logger.debug(f"Added hidden model: {display_name} → {internal_id}")
     
+    @staticmethod
+    def _measured_max_input_tokens(entry: Optional[Dict[str, Any]]) -> Optional[int]:
+        """
+        Return the UPSTREAM-MEASURED maxInputTokens of one raw entry, else None.
+        
+        A synthetic entry (``_is_hidden``) has measured nothing, so it never
+        contributes a limit of its own; neither does an entry whose tokenLimits are
+        absent, malformed, null or non-positive (e.g. a static FALLBACK_MODELS entry,
+        which carries only "modelId").
+        """
+        if not isinstance(entry, dict) or entry.get("_is_hidden"):
+            return None
+        limits = entry.get("tokenLimits")
+        if not isinstance(limits, dict):
+            return None
+        value = limits.get("maxInputTokens")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        return None
+
+    def resolve_max_input_tokens(self, model_id: str) -> Optional[int]:
+        """
+        Return the real maxInputTokens for a model, or None when it is unknown.
+        
+        Unlike :meth:`get_max_input_tokens` this NEVER substitutes a default, so a
+        caller that must not derive figures from a guessed denominator (context-usage
+        inversion) can tell "measured" from "unknown".
+        
+        Resolution is the same inheritance idea already used for public metadata and is
+        strictly SINGLE-HOP, so self-referential or cyclic configuration terminates:
+        
+        1. The model's own measured tokenLimits.
+        2. A synthetic alias entry (``add_hidden_model``) -> the limits of the internal
+           model it points at (``_internal_id``): "auto-kiro" yields "auto"'s limit.
+        3. An id that is not a cache entry at all but IS a key of MODEL_ALIASES (how
+           "auto-kiro" reaches the visible set) -> the limits of the alias target.
+        
+        Args:
+            model_id: Model ID or public alias
+        
+        Returns:
+            Measured maxInputTokens, or None when nothing is known.
+        """
+        entry = self._cache.get(model_id)
+        
+        direct = self._measured_max_input_tokens(entry)
+        if direct is not None:
+            return direct
+        
+        target: Optional[str] = None
+        if isinstance(entry, dict) and entry.get("_is_hidden"):
+            internal_id = entry.get("_internal_id")
+            if isinstance(internal_id, str) and internal_id and internal_id != model_id:
+                target = internal_id
+        if target is None:
+            # Read at call time so configuration (and tests) can change the map.
+            alias_target = MODEL_ALIASES.get(model_id)
+            if isinstance(alias_target, str) and alias_target and alias_target != model_id:
+                target = alias_target
+        if target is None:
+            return None
+        
+        # Single hop only: the target is never itself resolved again.
+        return self._measured_max_input_tokens(self._cache.get(target))
+
+    def has_measured_max_input_tokens(self, model_id: str) -> bool:
+        """True when a real (non-default) maxInputTokens is known for the model."""
+        return self.resolve_max_input_tokens(model_id) is not None
+
     def get_max_input_tokens(self, model_id: str) -> int:
         """
-        Returns maxInputTokens for the model.
+        Returns maxInputTokens for the model, falling back to a local default.
+        
+        Always an int, for callers that need a usable number. Use
+        :meth:`resolve_max_input_tokens` when a guessed value is not acceptable.
         
         Args:
             model_id: Model ID
@@ -280,9 +357,14 @@ class ModelInfoCache:
         Returns:
             Maximum number of input tokens or DEFAULT_MAX_INPUT_TOKENS
         """
-        model = self._cache.get(model_id)
-        if model and model.get("tokenLimits"):
-            return model["tokenLimits"].get("maxInputTokens") or DEFAULT_MAX_INPUT_TOKENS
+        resolved = self.resolve_max_input_tokens(model_id)
+        if resolved is not None:
+            return resolved
+        entry = self._cache.get(model_id)
+        if isinstance(entry, dict):
+            local_default = entry.get("_default_max_input_tokens")
+            if isinstance(local_default, int) and not isinstance(local_default, bool) and local_default > 0:
+                return local_default
         return DEFAULT_MAX_INPUT_TOKENS
     
     def is_empty(self) -> bool:
