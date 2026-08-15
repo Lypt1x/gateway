@@ -57,8 +57,12 @@ from kiro.streaming_core import (
 )
 from kiro.network_errors import (
     TRANSPORT_DROP_EXCEPTIONS,
+    MIDSTREAM_CLOSEOUT_EXCEPTIONS,
+    UpstreamStreamException,
     is_transport_drop_error,
+    should_closeout_midstream,
     describe_transport_drop,
+    describe_midstream_failure,
 )
 
 if TYPE_CHECKING:
@@ -442,30 +446,48 @@ async def stream_kiro_to_openai_internal(
         # Must always propagate - swallowing it hangs the ASGI task
         streaming_error_occurred = True
         raise
-    except TRANSPORT_DROP_EXCEPTIONS as e:
+    except MIDSTREAM_CLOSEOUT_EXCEPTIONS as e:
         # ==========================================================================
-        # Issue #129 - graceful close-out of a mid-stream transport drop.
+        # Issue #129 - graceful close-out of a mid-stream transport drop, extended
+        # (RECOMMENDATION 2) to application-level failure frames: an in-band
+        # exception frame (ThrottlingError, ...) or an invalidState event, which used
+        # to be silently discarded so the client saw a clean short answer.
         # End the SSE stream as a well-formed (truncated) completion instead of
-        # raising, so harnesses see a finished turn rather than a transport crash.
+        # raising, and for an in-band failure also report the reason in-band using
+        # the #268 error chunk.
         # ==========================================================================
-        if not is_transport_drop_error(e):  # pragma: no cover - defensive
+        if not should_closeout_midstream(e):  # pragma: no cover - defensive
             raise
+
+        in_band_failure = isinstance(e, UpstreamStreamException)
 
         streaming_error_occurred = True
 
         streaming_begun = bool(full_content or full_thinking_content or tool_calls_from_stream)
         if not streaming_begun:
             # Pre-first-token failure: let the route layer surface an error instead
-            logger.warning(f"OpenAI streaming failed before first token: {describe_transport_drop(e)}")
+            logger.warning(f"OpenAI streaming failed before first token: {describe_midstream_failure(e)}")
             raise
 
-        logger.warning(f"OpenAI streaming closed out gracefully: {describe_transport_drop(e)}")
+        logger.warning(f"OpenAI streaming closed out gracefully: {describe_midstream_failure(e)}")
+
+        if in_band_failure:
+            # Reuse the #268 in-band error chunk. UpstreamStreamException exposes
+            # `status_code` (429 for throttling, 502 otherwise) and `detail`, so the
+            # dialect mapping needs no special-casing there. Imported lazily:
+            # routes_openai imports this module.
+            try:
+                from kiro.routes_openai import build_sse_error_chunk
+                yield build_sse_error_chunk(e)
+            except ImportError:  # pragma: no cover - import guard
+                logger.debug("build_sse_error_chunk unavailable; error chunk skipped")
 
         # ---- Phase 2 (opt-in): one continuation round before closing out --------
         from kiro.config import MIDSTREAM_RESUME
 
         resume_allowed = (
             MIDSTREAM_RESUME
+            and not in_band_failure  # upstream refused deliberately; do not retry
             and bool(full_content)
             and not thinking_active
             and not tool_calls_from_stream
@@ -474,8 +496,8 @@ async def stream_kiro_to_openai_internal(
         if MIDSTREAM_RESUME and not resume_allowed:
             logger.debug(
                 "MIDSTREAM_RESUME enabled but continuation not allowed "
-                f"(content={bool(full_content)}, thinking_active={thinking_active}, "
-                f"tools={len(tool_calls_from_stream)})"
+                f"(in_band_failure={in_band_failure}, content={bool(full_content)}, "
+                f"thinking_active={thinking_active}, tools={len(tool_calls_from_stream)})"
             )
 
         if resume_allowed:

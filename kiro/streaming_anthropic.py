@@ -51,8 +51,12 @@ from kiro.streaming_core import (
 )
 from kiro.network_errors import (
     TRANSPORT_DROP_EXCEPTIONS,
+    MIDSTREAM_CLOSEOUT_EXCEPTIONS,
+    UpstreamStreamException,
     is_transport_drop_error,
+    should_closeout_midstream,
     describe_transport_drop,
+    describe_midstream_failure,
 )
 from kiro.tokenizer import count_tokens, estimate_request_tokens
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
@@ -713,38 +717,54 @@ async def stream_kiro_to_anthropic(
     except asyncio.CancelledError:
         # Must always propagate - swallowing it hangs the ASGI task
         raise
-    except TRANSPORT_DROP_EXCEPTIONS as e:
+    except MIDSTREAM_CLOSEOUT_EXCEPTIONS as e:
         # ==========================================================================
-        # Issue #129 - graceful close-out of a mid-stream transport drop.
+        # Issue #129 - graceful close-out of a mid-stream transport drop, extended
+        # (RECOMMENDATION 2) to application-level failure frames: an in-band
+        # exception frame (ThrottlingError, ValidationError, ...) or an invalidState
+        # event. Those used to match nothing at all, so the stream simply ended and
+        # the client saw a clean SHORT ANSWER with no error whatsoever.
         #
-        # The upstream byte stream died mid-response. Previously this propagated and
-        # the client saw a stream that simply stopped: no content_block_stop, no
-        # message_delta, no message_stop. Harnesses (OpenCode, Claude Code) read that
-        # as a transport crash and abort the session entirely.
-        #
-        # Instead we end the stream as a well-formed TRUNCATED turn. The client keeps
-        # the partial answer and can ask the model to continue.
+        # Either way we end the stream as a well-formed TRUNCATED turn, and for an
+        # in-band failure we ALSO emit an explicit `event: error` so the reason is
+        # visible to the client.
         # ==========================================================================
-        if not is_transport_drop_error(e):  # pragma: no cover - defensive
+        if not should_closeout_midstream(e):  # pragma: no cover - defensive
             raise
+
+        in_band_failure = isinstance(e, UpstreamStreamException)
 
         streaming_begun = bool(full_content or full_thinking_content or tool_blocks)
         if not streaming_begun:
             # Pre-first-token failure: nothing useful was delivered, so there is no
             # well-formed turn to close out. Let the route layer surface an error.
-            logger.warning(f"Anthropic streaming failed before first token: {describe_transport_drop(e)}")
+            logger.warning(f"Anthropic streaming failed before first token: {describe_midstream_failure(e)}")
             raise
 
-        logger.warning(f"Anthropic streaming closed out gracefully: {describe_transport_drop(e)}")
+        logger.warning(f"Anthropic streaming closed out gracefully: {describe_midstream_failure(e)}")
+
+        if in_band_failure:
+            # Anthropic dialect: throttling maps to rate_limit_error (the 429
+            # signal), anything else to api_error. Emitted BEFORE the block
+            # close-out so the client has the reason before the turn ends.
+            yield format_sse_event("error", {
+                "type": "error",
+                "error": {
+                    "type": "rate_limit_error" if e.is_throttling else "api_error",
+                    "message": f"Upstream ended the stream: {e.detail}"
+                }
+            })
 
         # ---- Phase 2 (opt-in): one continuation round before closing out --------
         # Allowed ONLY when a text block is open, no tool block is pending and we are
         # not inside a thinking block. Never opens a new block, never re-sends
-        # message_start.
+        # message_start. Never attempted for an in-band failure: upstream refused
+        # this turn deliberately, so an immediate retry would just be refused again.
         from kiro.config import MIDSTREAM_RESUME
 
         resume_allowed = (
             MIDSTREAM_RESUME
+            and not in_band_failure
             and text_block_started
             and text_block_index is not None
             and not thinking_block_started
@@ -754,8 +774,8 @@ async def stream_kiro_to_anthropic(
         if MIDSTREAM_RESUME and not resume_allowed:
             logger.debug(
                 "MIDSTREAM_RESUME enabled but continuation not allowed "
-                f"(text_open={text_block_started}, thinking_open={thinking_block_started}, "
-                f"tool_pending={pending_tool_block})"
+                f"(in_band_failure={in_band_failure}, text_open={text_block_started}, "
+                f"thinking_open={thinking_block_started}, tool_pending={pending_tool_block})"
             )
 
         if resume_allowed:

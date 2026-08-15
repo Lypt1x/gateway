@@ -116,6 +116,209 @@ NEVER_SWALLOW_EXCEPTIONS: Tuple[Type[BaseException], ...] = (
 )
 
 
+# ==================================================================================================
+# Application-level failure frames (RECOMMENDATION 2)
+# ==================================================================================================
+
+# Event-stream `:event-type` values that mean "the upstream gave up on this turn".
+# invalidStateEvent is the one the real client acts on; both spellings are accepted.
+INVALID_STATE_EVENT_TYPES: Tuple[str, ...] = (
+    "invalidState",
+    "invalidStateEvent",
+    "invalid_state_event",
+)
+
+# Exception-type name fragments that map to a rate-limit / 429 signal.
+_THROTTLING_MARKERS: Tuple[str, ...] = (
+    "throttl",              # ThrottlingError, ThrottlingException
+    "toomanyrequests",
+    "servicequotaexceeded",
+    "quotaexceeded",
+    "ratelimit",
+)
+
+
+class UpstreamStreamException(Exception):
+    """
+    An application-level failure frame arrived in the middle of a healthy stream.
+
+    This is NOT a transport drop (issue #129) and NOT a pre-header HTTP error
+    (issue #268): the socket is fine and the upstream deliberately sent an
+    exception / invalidState frame. Before this class existed such frames matched
+    nothing and were silently discarded, so the client saw a clean short answer
+    with no error at all.
+
+    Attributes:
+        exception_type: Upstream exception type name, e.g. "ThrottlingError",
+            or the event type for invalidState frames.
+        message: Upstream-supplied message ("" when the frame carried none).
+        event_type: The frame's ``:event-type``, when it had one.
+        is_throttling: True when the failure is a rate limit / quota signal.
+        status_code: HTTP-ish status for dialects that can carry one
+            (429 for throttling, 502 otherwise).
+    """
+
+    def __init__(
+        self,
+        exception_type: str,
+        message: str = "",
+        event_type: Optional[str] = None,
+    ):
+        self.exception_type = exception_type or "UnknownUpstreamError"
+        self.message = message or ""
+        self.event_type = event_type
+        self.is_throttling = any(
+            marker in self.exception_type.lower() for marker in _THROTTLING_MARKERS
+        )
+        self.status_code = 429 if self.is_throttling else 502
+        super().__init__(describe_stream_exception(self))
+
+    # `detail` lets routes_openai.build_sse_error_chunk() report the upstream
+    # message and status verbatim, with no special-casing there.
+    @property
+    def detail(self) -> str:
+        return f"{self.exception_type}: {self.message}" if self.message else self.exception_type
+
+
+def describe_stream_exception(error: "UpstreamStreamException") -> str:
+    """
+    One-line, log-friendly description of an application-level failure frame.
+
+    Args:
+        error: The UpstreamStreamException
+
+    Returns:
+        e.g. ``upstream sent an in-band failure frame: [ThrottlingError] Too many requests``
+    """
+    msg = error.message if error.message else "(no message)"
+    suffix = f" (event-type: {error.event_type})" if error.event_type else ""
+    return f"upstream sent an in-band failure frame: [{error.exception_type}] {msg}{suffix}"
+
+
+def _extract_frame_message(data: Any) -> str:
+    """Pulls a human-readable message out of a parsed frame payload."""
+    if isinstance(data, dict):
+        for key in ("message", "Message", "errorMessage", "reason", "detail"):
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                return value
+        # Nested {"error": {"message": ...}}
+        nested = data.get("error")
+        if isinstance(nested, dict):
+            return _extract_frame_message(nested)
+        return ""
+    if isinstance(data, str):
+        return data
+    return ""
+
+
+def _extract_frame_exception_type(data: Any, headers: Dict[str, Any]) -> Optional[str]:
+    """Pulls an exception type name out of headers first, then the payload."""
+    for header in (":exception-type", ":error-code", "x-amzn-errortype"):
+        value = headers.get(header)
+        if isinstance(value, str) and value:
+            # Smithy sometimes shapes this as `ThrottlingError:http://...`
+            return value.split(":", 1)[0].split("#")[-1]
+
+    if isinstance(data, dict):
+        for key in ("__type", "type", "code", "errorType", "name"):
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                return value.split(":", 1)[0].split("#")[-1]
+    return None
+
+
+def classify_stream_failure_frame(event: Dict[str, Any]) -> Optional[UpstreamStreamException]:
+    """
+    Turns a parser passthrough event into an UpstreamStreamException, or None if
+    the frame is benign and should keep being ignored.
+
+    Handles the two extension-point event types produced by
+    ``EventStreamRoutingParser._route_frame``:
+
+    - ``exception``: any frame whose ``:message-type`` is not ``event``, or that
+      carries an ``:exception-type`` header (ThrottlingError, ValidationError, ...).
+    - ``unknown_event``: only the ``invalidState`` family is treated as a failure.
+      Everything else (reasoningContentEvent, codeReferenceEvent, ...) stays ignored.
+
+    Args:
+        event: Internal parser event dict
+
+    Returns:
+        UpstreamStreamException to raise, or None to ignore the frame
+
+    Example:
+        >>> classify_stream_failure_frame({"type": "unknown_event",
+        ...                                "event_type": "reasoningContentEvent"}) is None
+        True
+    """
+    event_type_name = event.get("type")
+    headers = event.get("headers") or {}
+    data = event.get("data")
+
+    if event_type_name == "exception":
+        exception_type = (
+            event.get("exception_type")
+            or _extract_frame_exception_type(data, headers)
+            or event.get("message_type")
+            or "UnknownUpstreamError"
+        )
+        return UpstreamStreamException(
+            exception_type=exception_type,
+            message=_extract_frame_message(data),
+            event_type=event.get("event_type") or headers.get(":event-type"),
+        )
+
+    if event_type_name == "unknown_event":
+        frame_event_type = event.get("event_type") or ""
+        if frame_event_type not in INVALID_STATE_EVENT_TYPES:
+            return None
+        exception_type = _extract_frame_exception_type(data, headers) or "InvalidStateEvent"
+        return UpstreamStreamException(
+            exception_type=exception_type,
+            message=_extract_frame_message(data),
+            event_type=frame_event_type,
+        )
+
+    return None
+
+
+# Exceptions that end the client stream as a well-formed close-out rather than a
+# crash: mid-stream transport drops (#129) plus in-band failure frames.
+MIDSTREAM_CLOSEOUT_EXCEPTIONS: Tuple[Type[BaseException], ...] = (
+    TRANSPORT_DROP_EXCEPTIONS + (UpstreamStreamException,)
+)
+
+
+def should_closeout_midstream(error: BaseException) -> bool:
+    """
+    Returns True if the streaming layer should close the client stream out
+    gracefully instead of propagating.
+
+    Never true for GeneratorExit, asyncio.CancelledError or FirstTokenTimeoutError.
+
+    Args:
+        error: The exception that ended the stream
+    """
+    if isinstance(error, NEVER_SWALLOW_EXCEPTIONS):
+        return False
+    if isinstance(error, UpstreamStreamException):
+        return True
+    return is_transport_drop_error(error)
+
+
+def describe_midstream_failure(error: BaseException) -> str:
+    """
+    One-line description for either flavour of mid-stream failure.
+
+    Args:
+        error: A transport drop or an UpstreamStreamException
+    """
+    if isinstance(error, UpstreamStreamException):
+        return describe_stream_exception(error)
+    return describe_transport_drop(error)
+
+
 def is_transport_drop_error(error: BaseException) -> bool:
     """
     Returns True if the exception represents a mid-stream transport drop.
