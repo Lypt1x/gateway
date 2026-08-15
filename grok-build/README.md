@@ -91,6 +91,32 @@ would emit a failing request. Secret values are never printed.
 | `--env-key NAME` | `KIRO_GATEWAY_KEY` |
 | `--write` | off — `setup` / `update` are **dry run** by default |
 
+## Required environment variables
+
+A correct config file is not enough — `doctor` also checks the environment and reports a
+missing variable as drift (exit 1). Both variables must be set **in the interactive shell
+that runs `grok`**, not just in a service unit:
+
+| Variable | Why |
+|----------|-----|
+| the name in `[model.*] env_key` (default `KIRO_GATEWAY_KEY`) | the key Grok sends as `Authorization: Bearer` for **inference**. Unset, Grok falls back to its grok.com login session and sends its own xAI token, which this gateway rejects — the observed symptom is a login prompt followed by `4 authenticated inference requests were still rejected (401)`. |
+| `XAI_API_KEY` | the key Grok uses for the **model-list fetch** (`{base_url}/models`) specifically. |
+
+`XAI_API_KEY` is needed even though the key is *ours* and not xAI's: it is just the
+variable name Grok reads for discovery, and the per-model `env_key` covers inference only.
+Set it to the same gateway key. Measured: without it, every `grok` run produced 2x
+`GET /v1/models` 401 and Grok silently fell back to whatever `[model.*]` tables were in
+the file — so the `context_window` we publish on `/v1/models` was never read.
+
+`doctor` checks presence via `os.environ` only. It never reads, compares, prints or echoes
+a value; findings name the variable only.
+
+Note on `[models] prompt_suggestions`: this fifth auxiliary role
+(`GROK_PROMPT_SUGGESTIONS_MODEL`) is emitted alongside the other four. Evidence that the
+config key is accepted is **weak** — a probe with the key set produced no "unrecognized
+config key" warning, but unlike the other four it was not found in the interned key list
+recovered from the binary. It is a TUI-only feature, so headless tests cannot exercise it.
+
 ## Safety
 
 - **Your file is preserved as text.** The stdlib has no TOML writer, and round-tripping

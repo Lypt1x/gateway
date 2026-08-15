@@ -25,6 +25,7 @@ models_base_url = "http://localhost:8000/v1"
 [models]
 default = "claude-sonnet-4.5"
 session_summary = "gpt-5.6-terra"
+prompt_suggestions = "gpt-5.6-terra"
 image_description = "claude-sonnet-4.5"
 web_search = "claude-sonnet-4.5"
 
@@ -72,8 +73,13 @@ def stub_fetch(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
-    for var in ("KIRO_GATEWAY_URL", "KIRO_GATEWAY_KEY", "PROXY_API_KEY"):
+    for var in ("KIRO_GATEWAY_URL", "KIRO_GATEWAY_KEY", "PROXY_API_KEY", "XAI_API_KEY"):
         monkeypatch.delenv(var, raising=False)
+
+
+# A healthy environment for the doctor env checks. Values are dummies and are never read
+# by the helper — only presence is checked.
+HEALTHY_ENV = {"KIRO_GATEWAY_KEY": "dummy-never-read", "XAI_API_KEY": "dummy-never-read"}
 
 
 def healthy_config() -> str:
@@ -196,18 +202,21 @@ def test_update_refreshes_stale_context_window(tmp_path, stub_fetch):
 # --------------------------------------------------------------------------- #
 # doctor
 # --------------------------------------------------------------------------- #
-def test_doctor_healthy_exits_zero(tmp_path, stub_fetch, capsys):
+def test_doctor_healthy_exits_zero(tmp_path, stub_fetch, capsys, monkeypatch):
     path = tmp_path / "config.toml"
     path.write_text(healthy_config(), encoding="utf-8")
+    for name, value in HEALTHY_ENV.items():
+        monkeypatch.setenv(name, value)
 
     assert gb.main(["doctor", "--config", str(path)]) == gb.EXIT_OK
     assert "up to date" in capsys.readouterr().out
 
 
-def _doctor(tmp_path, text):
+def _doctor(tmp_path, text, environ=None):
     path = tmp_path / "config.toml"
     path.write_text(text, encoding="utf-8")
-    return gb.diagnose(text, LIVE, str(path))
+    return gb.diagnose(text, LIVE, str(path),
+                       environ=dict(HEALTHY_ENV) if environ is None else environ)
 
 
 def test_doctor_detects_missing_models_base_url(tmp_path):
@@ -404,3 +413,87 @@ def test_unparseable_local_config_is_clean_error(tmp_path, stub_fetch, capsys):
 
 def test_default_config_path_is_dot_grok():
     assert gb.config_path(None).endswith("/.grok/config.toml")
+
+
+
+# --------------------------------------------------------------------------------------
+# environment checks: a byte-perfect config still fails when the key is absent from the
+# interactive shell. Observed for a real user: Grok prompted for login, fell back to its
+# grok.com session, sent its own xAI token, and the gateway rejected every inference with
+# 401 — while `doctor` reported "up to date". Presence only; never a value.
+# --------------------------------------------------------------------------------------
+def test_doctor_flags_unset_env_key_variable_by_name(tmp_path):
+    findings = _doctor(tmp_path, healthy_config(),
+                       environ={"XAI_API_KEY": "dummy-never-read"})
+    matches = [f for f in findings if "KIRO_GATEWAY_KEY" in f]
+    assert matches, findings
+    assert "not set in this environment" in matches[0]
+
+
+def test_doctor_exits_one_when_env_key_variable_is_unset(tmp_path, stub_fetch, monkeypatch):
+    path = tmp_path / "config.toml"
+    path.write_text(healthy_config(), encoding="utf-8")
+    monkeypatch.setenv("XAI_API_KEY", "dummy-never-read")
+    monkeypatch.delenv("KIRO_GATEWAY_KEY", raising=False)
+
+    assert gb.main(["doctor", "--config", str(path)]) == gb.EXIT_DRIFT
+
+
+def test_doctor_flags_unset_xai_api_key_with_model_list_explanation(tmp_path):
+    findings = _doctor(tmp_path, healthy_config(),
+                       environ={"KIRO_GATEWAY_KEY": "dummy-never-read"})
+    matches = [f for f in findings if "XAI_API_KEY" in f]
+    assert matches, findings
+    assert "model-list" in matches[0]
+    assert "fall" in matches[0]
+
+
+def test_doctor_exits_one_when_xai_api_key_is_unset(tmp_path, stub_fetch, monkeypatch):
+    path = tmp_path / "config.toml"
+    path.write_text(healthy_config(), encoding="utf-8")
+    monkeypatch.setenv("KIRO_GATEWAY_KEY", "dummy-never-read")
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+
+    assert gb.main(["doctor", "--config", str(path)]) == gb.EXIT_DRIFT
+
+
+def test_doctor_reports_no_env_findings_when_both_are_set(tmp_path):
+    findings = _doctor(tmp_path, healthy_config())
+    assert findings == []
+
+
+def test_doctor_env_findings_never_echo_a_secret_value(tmp_path, stub_fetch, capsys,
+                                                       monkeypatch):
+    """Even when the variables ARE set, no value may appear in any doctor output."""
+    path = tmp_path / "config.toml"
+    path.write_text(healthy_config().replace('context_window = 200000',
+                                             'context_window = 1'), encoding="utf-8")
+    monkeypatch.setenv("KIRO_GATEWAY_KEY", SECRET)
+    monkeypatch.setenv("XAI_API_KEY", SECRET)
+
+    assert gb.main(["doctor", "--config", str(path)]) == gb.EXIT_DRIFT
+    captured = capsys.readouterr()
+    assert SECRET not in captured.out
+    assert SECRET not in captured.err
+
+
+def test_doctor_env_check_ignores_a_literal_secret_env_key(tmp_path):
+    """An env_key holding a secret is reported as such, not looked up in the environment."""
+    text = healthy_config().replace('env_key = "KIRO_GATEWAY_KEY"',
+                                    f'env_key = "{SECRET}"', 1)
+    findings = _doctor(tmp_path, text)
+    assert any("looks like a literal secret" in f for f in findings)
+    assert not any(SECRET in f for f in findings)
+
+
+def test_doctor_detects_missing_prompt_suggestions(tmp_path):
+    text = healthy_config().replace('prompt_suggestions = "gpt-5.6-terra"\n', "")
+    findings = _doctor(tmp_path, text)
+    assert any("prompt_suggestions is not set" in f for f in findings)
+
+
+def test_doctor_detects_prompt_suggestions_naming_unavailable_model(tmp_path):
+    text = healthy_config().replace('prompt_suggestions = "gpt-5.6-terra"',
+                                    'prompt_suggestions = "grok-4.6"')
+    findings = _doctor(tmp_path, text)
+    assert any("prompt_suggestions" in f and "grok-4.6" in f for f in findings)

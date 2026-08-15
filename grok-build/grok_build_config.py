@@ -327,8 +327,23 @@ def _models_of(document: dict) -> dict:
 # INVALID_MODEL_ID, so every session emitted one doomed request and session titles fell
 # back to truncated user text. image_description is optional: the gateway omits it when
 # no visible model accepts image input, and a missing key is better than a wrong one.
-AUX_ROLES = ("session_summary", "web_search")
+AUX_ROLES = ("session_summary", "web_search", "prompt_suggestions")
 OPTIONAL_ROLES = ("image_description",)
+
+# Grok authenticates the MODEL-LIST fetch (GET {base_url}/models) with XAI_API_KEY
+# specifically; the per-model `env_key` only covers INFERENCE. Measured: without
+# XAI_API_KEY every `grok` invocation produced 2x `GET /v1/models` 401 and Grok silently
+# fell back to whatever [model.*] tables happened to be in the file; with it set, 0x 401
+# and 1x 200. So the file can be perfectly correct and discovery still be broken.
+MODEL_LIST_ENV_VAR = "XAI_API_KEY"
+
+_XAI_EXPLANATION = (
+    f"{MODEL_LIST_ENV_VAR} is not set in this environment. Grok authenticates its "
+    f"model-list fetch ({{base_url}}/models) with {MODEL_LIST_ENV_VAR} specifically — "
+    "the per-model env_key only covers inference — so discovery fails silently (401) "
+    "and Grok falls back to whatever [model.*] tables happen to be in this file. "
+    f"Export {MODEL_LIST_ENV_VAR} with the same gateway key."
+)
 
 _AUX_EXPLANATION = (
     "Grok would fall back to its built-in xAI model for this role, and every session "
@@ -366,7 +381,46 @@ def _diagnose_roles(local: dict, live_models: dict) -> list[str]:
     return findings
 
 
-def diagnose(existing_text: str, document_text: str, path: str) -> list[str]:
+def diagnose_environment(local: dict, environ=None) -> list[str]:
+    """
+    Report environment-level drift. The config file can be byte-perfect and Grok still
+    fail because the key is absent from the interactive shell — the real user-reported
+    failure mode: Grok fell back to grok.com session auth and sent its own xAI token to
+    the gateway, which rejected all inference with 401.
+
+    Presence is checked with `in os.environ` only. No value is ever read, compared,
+    printed or echoed — findings name the VARIABLE only.
+    """
+    env = os.environ if environ is None else environ
+    findings: list[str] = []
+
+    names: list[str] = []
+    for model_id, table in sorted(_models_of(local).items()):
+        if not isinstance(table, dict):
+            continue
+        env_key = table.get("env_key")
+        if isinstance(env_key, str) and looks_like_env_name(env_key):
+            name = env_key.strip()
+            if name not in names:
+                names.append(name)
+
+    for name in names:
+        if name not in env:
+            findings.append(
+                f"environment variable {name} (named by [model.*] env_key) is not set "
+                "in this environment, so Grok cannot authenticate to this gateway. It "
+                "would fall back to its grok.com login session and send an xAI token, "
+                f"which this gateway rejects with 401. Export {name} in the shell that "
+                "runs `grok` (value not shown or read)."
+            )
+
+    if MODEL_LIST_ENV_VAR not in env:
+        findings.append(_XAI_EXPLANATION)
+
+    return findings
+
+
+def diagnose(existing_text: str, document_text: str, path: str, environ=None) -> list[str]:
     """Report drift between the local config and the live gateway document."""
     live = parse_toml(document_text, "gateway document")
     local = parse_toml(existing_text, path)
@@ -447,6 +501,8 @@ def diagnose(existing_text: str, document_text: str, path: str) -> list[str]:
                 f"model '{model_id}' sets api_key inline (value not shown). Prefer "
                 "env_key so no secret is stored on disk."
             )
+
+    findings += diagnose_environment(local, environ)
 
     return findings
 

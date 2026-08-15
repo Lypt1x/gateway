@@ -484,8 +484,10 @@ def _toml_key(key: str) -> str:
     return _toml_string(key)
 
 
-# Grok's [models] table accepts exactly these keys (recovered from the binary's interned
-# key list): default, web_search, image_description, session_summary. Any role left unset
+# Grok's [models] table accepts these keys: default, web_search, image_description,
+# session_summary (all four recovered from the binary's interned key list) plus
+# prompt_suggestions, which the binary's env-var table exposes as
+# GROK_PROMPT_SUGGESTIONS_MODEL. Any role left unset
 # falls back to Grok's built-in xAI model, so all of them are pinned to visible models.
 GROK_IMAGE_INPUT_TYPE = "IMAGE"
 
@@ -544,6 +546,7 @@ def build_grok_build_config(
                                       needed.
         [models] default              which model the CLI starts on
         [models] session_summary      cheapest visible model (titles are throwaway work)
+        [models] prompt_suggestions   cheapest visible model (also throwaway work)
         [models] image_description     a visible image-capable model, omitted if none
         [models] web_search           same as default
         [model."<id>"]                per-model overrides: model, name, api_backend,
@@ -584,7 +587,15 @@ def build_grok_build_config(
         # against its OWN built-in xAI model (observed: aux_model=grok-4.6), which this
         # gateway rejects with INVALID_MODEL_ID — one failing request per session, and
         # session titles silently degraded to truncated user text.
-        lines.append(f"session_summary = {_toml_string(_grok_cheapest_model(ids, metadata_for))}")
+        cheapest_id = _grok_cheapest_model(ids, metadata_for)
+        lines.append(f"session_summary = {_toml_string(cheapest_id)}")
+        # prompt_suggestions is the fifth auxiliary role (GROK_PROMPT_SUGGESTIONS_MODEL).
+        # It is a TUI-only feature, so it never showed up in headless testing; it is also
+        # throwaway work, so it uses the same cheapest-by-rate_multiplier rule as
+        # session_summary. WEAK evidence that the key is accepted: a probe with it set
+        # produced no "unrecognized config key" warning, but it is absent from the
+        # interned key list recovered from the binary.
+        lines.append(f"prompt_suggestions = {_toml_string(cheapest_id)}")
         image_model = _grok_image_model(ids, metadata_for)
         if image_model is not None:
             lines.append(f"image_description = {_toml_string(image_model)}")

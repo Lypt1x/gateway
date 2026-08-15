@@ -349,7 +349,10 @@ class TestAuxiliaryModelRoles:
             "gamma": {"rate_multiplier": 9.0},
         }
         body = tomllib.loads(build(ids, meta))["models"]
-        assert set(body) == {"default", "session_summary", "image_description", "web_search"}
+        assert set(body) == {
+            "default", "session_summary", "prompt_suggestions",
+            "image_description", "web_search",
+        }
         for role, value in body.items():
             assert value in ids, role
 
@@ -387,3 +390,51 @@ class TestAuxiliaryModelRoles:
         roles = doc(response)["models"]
         assert roles["session_summary"] == "claude-sonnet-4.5"
         assert roles["web_search"] == "claude-sonnet-4.5"
+
+
+
+# --------------------------------------------------------------------------------------
+# prompt_suggestions: the FIFTH auxiliary role (GROK_PROMPT_SUGGESTIONS_MODEL). A TUI-only
+# feature, so headless testing never exercised it. Throwaway work, so it uses the same
+# cheapest-by-rate_multiplier rule as session_summary.
+# --------------------------------------------------------------------------------------
+class TestPromptSuggestionsRole:
+
+    def test_emitted_and_equals_cheapest_by_rate(self):
+        meta = {
+            "expensive": {"rate_multiplier": 4.0},
+            "cheap": {"rate_multiplier": 0.25},
+            "mid": {"rate_multiplier": 1.0},
+        }
+        body = tomllib.loads(build(["expensive", "mid", "cheap"], meta))["models"]
+        assert body["prompt_suggestions"] == "cheap"
+        assert body["prompt_suggestions"] == body["session_summary"]
+
+    def test_rate_ties_break_on_sorted_id(self):
+        meta = {"zeta": {"rate_multiplier": 0.5}, "alpha": {"rate_multiplier": 0.5}}
+        body = tomllib.loads(build(["zeta", "alpha"], meta))["models"]
+        assert body["prompt_suggestions"] == "alpha"
+
+    def test_degrades_to_default_without_rate_metadata(self):
+        body = tomllib.loads(build(["first", "second"]))["models"]
+        assert body["prompt_suggestions"] == body["default"] == "first"
+
+    def test_omitted_when_visible_set_is_empty(self):
+        text = build([])
+        assert "prompt_suggestions" not in text
+        assert "models" not in tomllib.loads(text)
+
+    def test_never_names_a_model_outside_the_visible_set(self):
+        ids = ["alpha", "beta"]
+        meta = {"beta": {"rate_multiplier": 0.1}}
+        body = tomllib.loads(build(ids, meta))["models"]
+        assert body["prompt_suggestions"] in ids
+
+    def test_document_still_parses_and_carries_no_secret(self):
+        """The generator must never read the configured gateway key."""
+        text = build(["alpha", "beta"], {"beta": {"rate_multiplier": 0.1}})
+        parsed = tomllib.loads(text)  # explicit: still valid TOML with the new key
+        assert parsed["models"]["prompt_suggestions"] == "beta"
+        assert PROXY_API_KEY
+        assert PROXY_API_KEY not in text
+        assert "KIRO_GATEWAY_KEY" in text
