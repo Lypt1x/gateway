@@ -40,7 +40,7 @@ from loguru import logger
 
 from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
 from kiro.auth import KiroAuthManager
-from kiro.utils import get_kiro_headers
+from kiro.utils import get_kiro_headers, new_invocation_id
 from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
 
 
@@ -208,12 +208,22 @@ class KiroHttpClient:
         last_error = None
         last_error_info: Optional[NetworkErrorInfo] = None
         last_response: Optional[httpx.Response] = None  # Для сохранения последнего 429/5xx
-        
+
+        # smithy-rs semantics: one invocation id per logical operation, reused across
+        # every retry of that operation, while amz-sdk-request's attempt increments.
+        invocation_id = new_invocation_id()
+
         for attempt in range(max_retries):
             try:
                 # Get current token
                 token = await self.auth_manager.get_access_token()
-                headers = get_kiro_headers(self.auth_manager, token)
+                headers = get_kiro_headers(
+                    self.auth_manager,
+                    token,
+                    invocation_id=invocation_id,
+                    attempt=attempt + 1,
+                    max_attempts=max_retries,
+                )
                 
                 # Build request kwargs based on parameters
                 request_kwargs = {"headers": headers}

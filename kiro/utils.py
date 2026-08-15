@@ -27,12 +27,91 @@ and other common utilities.
 import hashlib
 import json
 import uuid
-from typing import TYPE_CHECKING, List, Dict, Any
+from typing import TYPE_CHECKING, List, Dict, Any, Optional
 
 from loguru import logger
 
+from kiro.config import CODEWHISPERER_OPTOUT, KIRO_AGENT_MODE, PROFILE_ARN
+
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
+
+
+# ==================================================================================================
+# Client identity (User-Agent) — smithy-rs / AWS SDK for Rust shape
+# ==================================================================================================
+#
+# The real client is a Rust binary using the smithy-rs code-generated client
+# `amzn-codewhisperer-streaming-client`, NOT a JavaScript aws-sdk-js client.
+# Every token below is centralised here so it can be bumped in one place.
+#
+# Evidence (byte offsets in /home/prism/.local/bin/kiro-cli-chat):
+#   aws-sdk-<name>/<ver>            smithy-rs SdkMetadata Display; `aws-sdk-` fragment present,
+#                                   version taken from the bundled runtime crate below
+#   aws-smithy-runtime-1.11.1       contiguous literal (crate path), source of UA_SDK_VERSION
+#   ua/                             @6868722 (UA metadata prefix; smithy-rs 1.11.1 emits 2.1)
+#   os/ + linux|macos|windows|...   @6868730 ("...windowslinuxmacosandroidiosotheros//ua/")
+#   lang/                           @6868805
+#   md/                             @6868810
+#   codewhispererstreaming 0.1.17975 @6728714, adjacent to `ApiMetadata service_id version`
+#   md/appVersion + 2.18.0          @399751182 (user_agent_override_interceptor.rs)
+#   app/AmazonQ-For-CLI             @398430936 (contiguous literal)
+#
+# The literal `KiroIDE` appears ZERO times in the real binary, and no real client appends a
+# per-install sha256 to its User-Agent. Both were gateway inventions and have been removed.
+UA_SDK_NAME: str = "rust"
+UA_SDK_VERSION: str = "1.11.1"
+UA_METADATA_VERSION: str = "2.1"
+UA_API_SERVICE_ID: str = "codewhispererstreaming"
+UA_API_VERSION: str = "0.1.17975"
+UA_OS_FAMILY: str = "linux"
+UA_LANG: str = "rust"
+UA_APP_VERSION: str = "2.18.0"
+UA_APP_NAME: str = "AmazonQ-For-CLI"
+
+
+def build_kiro_user_agent() -> str:
+    """
+    Builds the smithy-rs UA-2.1 User-Agent string used by the real kiro-cli.
+
+    Token order follows the smithy-rs `AwsUserAgent` Display implementation:
+    sdk metadata, ua metadata, api metadata, os metadata, language metadata,
+    additional metadata, app name.
+
+    Returns:
+        The full User-Agent value (identical to x-amz-user-agent).
+    """
+    return (
+        f"aws-sdk-{UA_SDK_NAME}/{UA_SDK_VERSION} "
+        f"ua/{UA_METADATA_VERSION} "
+        f"api/{UA_API_SERVICE_ID}/{UA_API_VERSION} "
+        f"os/{UA_OS_FAMILY} "
+        f"lang/{UA_LANG} "
+        f"md/appVersion/{UA_APP_VERSION} "
+        f"app/{UA_APP_NAME}"
+    )
+
+
+#: Precomputed User-Agent. smithy-rs sends the same value on both UA headers.
+KIRO_USER_AGENT: str = build_kiro_user_agent()
+
+#: Default max attempts advertised in `amz-sdk-request` (smithy-rs StandardRetryStrategy default).
+SDK_MAX_ATTEMPTS: int = 3
+
+
+def new_invocation_id() -> str:
+    """
+    Creates an `amz-sdk-invocation-id` value.
+
+    smithy-rs' `InvocationIdInterceptor` generates this ONCE per logical operation
+    (in `read_before_execution`) and reuses it for every retry of that operation.
+    Callers must therefore create it outside their retry loop and pass it in to
+    :func:`get_kiro_headers` on each attempt.
+
+    Returns:
+        A fresh UUID4 string.
+    """
+    return str(uuid.uuid4())
 
 
 def get_machine_fingerprint() -> str:
@@ -58,35 +137,51 @@ def get_machine_fingerprint() -> str:
         return hashlib.sha256(b"default-kiro-gateway").hexdigest()
 
 
-def get_kiro_headers(auth_manager: "KiroAuthManager", token: str) -> dict:
+def get_kiro_headers(
+    auth_manager: "KiroAuthManager",
+    token: str,
+    invocation_id: Optional[str] = None,
+    attempt: int = 1,
+    max_attempts: int = SDK_MAX_ATTEMPTS,
+) -> dict:
     """
-    Builds headers for Kiro API requests.
-    
-    Includes all necessary headers for authentication and identification:
-    - Authorization with Bearer token
-    - User-Agent with fingerprint
-    - AWS CodeWhisperer specific headers
-    
+    Builds headers for Kiro API requests, matching the real kiro-cli on the wire.
+
     Args:
-        auth_manager: Authentication manager for obtaining fingerprint
+        auth_manager: Authentication manager (source of the profile ARN)
         token: Access token for authorization
-    
+        invocation_id: `amz-sdk-invocation-id` for the logical operation. MUST be
+            stable across retries of the same call — create it once with
+            :func:`new_invocation_id` outside the retry loop. A fresh id is
+            generated when omitted (single-attempt callers).
+        attempt: 1-based attempt number for `amz-sdk-request`.
+        max_attempts: Max attempts advertised in `amz-sdk-request`.
+
     Returns:
         Dictionary with headers for HTTP request
     """
-    fingerprint = auth_manager.fingerprint
-    
-    return {
+    headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/x-amz-json-1.0",
         "x-amz-target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-        "User-Agent": f"aws-sdk-js/1.0.27 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-0.7.45-{fingerprint}",
-        "x-amz-user-agent": f"aws-sdk-js/1.0.27 KiroIDE-0.7.45-{fingerprint}",
-        "x-amzn-codewhisperer-optout": "true",
-        "x-amzn-kiro-agent-mode": "vibe",
-        "amz-sdk-invocation-id": str(uuid.uuid4()),
-        "amz-sdk-request": "attempt=1; max=3",
+        # smithy-rs sets both UA headers to the same value.
+        "User-Agent": KIRO_USER_AGENT,
+        "x-amz-user-agent": KIRO_USER_AGENT,
+        # PRIVACY OVERRIDE: the real client sends "false"; we default to "true" so the
+        # user's content is not used for service improvement. See CODEWHISPERER_OPTOUT.
+        "x-amzn-codewhisperer-optout": "true" if CODEWHISPERER_OPTOUT else "false",
+        "x-amzn-kiro-agent-mode": KIRO_AGENT_MODE,
+        "amz-sdk-invocation-id": invocation_id or new_invocation_id(),
+        "amz-sdk-request": f"attempt={attempt}; max={max_attempts}",
     }
+
+    # Real header (confirmed literal @6730542). Sourced exactly like the routes source
+    # the body's profileArn. Omitted entirely when unknown — never sent blank.
+    profile_arn = getattr(auth_manager, "profile_arn", None) or PROFILE_ARN
+    if profile_arn:
+        headers["x-amzn-kiro-profile-arn"] = profile_arn
+
+    return headers
 
 
 def generate_completion_id() -> str:

@@ -101,12 +101,13 @@ class TestMCPHeaders:
             await call_kiro_mcp_api("q", mock_auth_manager)
 
         headers = post.call_args.kwargs["headers"]
-        assert "Kiro" in headers["User-Agent"]
+        assert "app/AmazonQ-For-CLI" in headers["User-Agent"]
+        assert "KiroIDE" not in headers["User-Agent"]
         assert headers["Content-Type"] == "application/json"
         assert "x-amz-target" not in headers
         assert headers["x-amzn-codewhisperer-optout"] == "false"
-        assert headers["x-amzn-kiro-agent-mode"] == "vibe"
-        assert "x-amz-user-agent" in headers
+        assert headers["x-amzn-kiro-agent-mode"] == "kiro_default"
+        assert headers["x-amz-user-agent"] == headers["User-Agent"]
         assert headers["Authorization"].startswith("Bearer ")
 
 
