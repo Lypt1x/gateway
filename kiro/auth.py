@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sqlite3
+import tempfile
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 from pathlib import Path
@@ -169,6 +170,13 @@ class KiroAuthManager:
         self._expires_at: Optional[datetime] = None
         self._lock = asyncio.Lock()
         
+        # Issue #203: refresh token as last seen in the credential store.
+        # Used as the compare-and-set baseline for write-back so a concurrent
+        # refresher (host kiro-cli, Kiro IDE, another container) is never clobbered.
+        self._loaded_refresh_token: Optional[str] = refresh_token
+        # Set to True by _try_save_to_key() when the store changed underneath us.
+        self._last_write_conflict: bool = False
+        
         # Auth type will be determined after loading credentials
         self._auth_type: AuthType = AuthType.KIRO_DESKTOP
         
@@ -294,6 +302,7 @@ class KiroAuthManager:
                         self._access_token = token_data['access_token']
                     if 'refresh_token' in token_data:
                         self._refresh_token = token_data['refresh_token']
+                        self._loaded_refresh_token = token_data['refresh_token']
                     if 'profile_arn' in token_data:
                         self._profile_arn = token_data['profile_arn']
                     if 'region' in token_data:
@@ -416,6 +425,7 @@ class KiroAuthManager:
             # Load common data from file
             if 'refreshToken' in data:
                 self._refresh_token = data['refreshToken']
+                self._loaded_refresh_token = data['refreshToken']
             if 'accessToken' in data:
                 self._access_token = data['accessToken']
             if 'profileArn' in data:
@@ -486,15 +496,91 @@ class KiroAuthManager:
         except Exception as e:
             logger.error(f"Error loading enterprise device registration: {e}")
     
+    def _peek_on_disk_refresh_token(self) -> Optional[str]:
+        """
+        Reads the refresh token currently stored on disk without mutating state.
+        
+        Issue #203: another process (host kiro-cli, Kiro IDE, a second container)
+        may have rotated the shared, single-use refresh token since we loaded it.
+        This is a read-only probe used to detect that before we spend our copy.
+        
+        Never logs token values.
+        
+        Returns:
+            The stored refresh token, or None if it cannot be determined.
+        """
+        try:
+            if self._sqlite_db:
+                path = Path(self._sqlite_db).expanduser()
+                if not path.exists():
+                    return None
+                conn = sqlite3.connect(str(path), timeout=5.0)
+                try:
+                    cursor = conn.cursor()
+                    keys = [self._sqlite_token_key] if self._sqlite_token_key else []
+                    keys += [k for k in SQLITE_TOKEN_KEYS if k != self._sqlite_token_key]
+                    for key in keys:
+                        cursor.execute("SELECT value FROM auth_kv WHERE key = ?", (key,))
+                        row = cursor.fetchone()
+                        if row:
+                            return json.loads(row[0]).get("refresh_token")
+                finally:
+                    conn.close()
+                return None
+            
+            if self._creds_file:
+                path = Path(self._creds_file).expanduser()
+                if not path.exists():
+                    return None
+                with open(path, 'r', encoding='utf-8') as f:
+                    return json.load(f).get("refreshToken")
+        except Exception as e:
+            logger.debug(f"Could not read on-disk refresh token: {e}")
+        
+        return None
+    
+    def _adopt_on_disk_credentials_if_changed(self) -> bool:
+        """
+        Adopts on-disk credentials if the stored refresh token is no longer ours.
+        
+        Issue #203: AWS SSO OIDC refresh tokens rotate and are single-use. If a
+        concurrent refresher already rotated the shared credential, refreshing our
+        in-memory copy would fail *and* revoke the token that is actually valid.
+        Adopting the on-disk credential instead is safe and usually sufficient.
+        
+        Returns:
+            True if on-disk credentials were adopted, False if nothing changed.
+        """
+        on_disk_token = self._peek_on_disk_refresh_token()
+        if not on_disk_token or on_disk_token == self._refresh_token:
+            return False
+        
+        logger.warning(
+            "On-disk refresh token differs from the in-memory copy "
+            "(another process refreshed the shared credential); "
+            "adopting on-disk credentials instead of refreshing a stale token"
+        )
+        if self._sqlite_db:
+            self._load_credentials_from_sqlite(self._sqlite_db)
+        elif self._creds_file:
+            self._load_credentials_from_file(self._creds_file)
+        return True
+    
     def _save_credentials_to_file(self) -> None:
         """
         Saves updated credentials to a JSON file.
         
         Updates the existing file while preserving other fields.
+        
+        The write is atomic (Issue #203): the merged document goes to a temporary
+        file in the same directory and is then moved into place with os.replace(),
+        so a concurrent reader never observes a truncated file and a failed write
+        never destroys the existing credentials.
         """
         if not self._creds_file:
             return
         
+        tmp_name: Optional[str] = None
         try:
             path = Path(self._creds_file).expanduser()
             
@@ -512,14 +598,29 @@ class KiroAuthManager:
             if self._profile_arn:
                 existing_data['profileArn'] = self._profile_arn
             
-            # Save
-            with open(path, 'w', encoding='utf-8') as f:
+            # Atomic save: temp file in the same directory, then rename over target
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+            )
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(existing_data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, path)
+            tmp_name = None
             
+            self._loaded_refresh_token = self._refresh_token
             logger.debug(f"Credentials saved to {self._creds_file}")
             
         except Exception as e:
             logger.error(f"Error saving credentials: {e}")
+        finally:
+            # Never leave a partial temp file behind; the original stays intact
+            if tmp_name:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
     
     def _save_credentials_to_sqlite(self) -> None:
         """
@@ -550,31 +651,64 @@ class KiroAuthManager:
                 logger.warning(f"SQLite database not found for writing: {self._sqlite_db}")
                 return
             
-            # Use timeout to avoid blocking if database is locked
-            conn = sqlite3.connect(str(path), timeout=5.0)
+            # Use timeout to avoid blocking if database is locked.
+            # isolation_level=None + explicit BEGIN IMMEDIATE (Issue #203): the read
+            # and the compare-and-set write must be one serialised write transaction,
+            # otherwise a concurrent refresher's update is silently lost.
+            conn = sqlite3.connect(str(path), timeout=5.0, isolation_level=None)
             cursor = conn.cursor()
+            self._last_write_conflict = False
             
-            # Try to save to the known key first (if we have it)
-            if self._sqlite_token_key:
-                if self._try_save_to_key(cursor, self._sqlite_token_key):
-                    conn.commit()
-                    conn.close()
-                    logger.debug(f"Credentials saved to SQLite key: {self._sqlite_token_key} (merged)")
-                    return
-                else:
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                
+                # Try to save to the known key first (if we have it)
+                if self._sqlite_token_key:
+                    if self._try_save_to_key(cursor, self._sqlite_token_key):
+                        conn.commit()
+                        conn.close()
+                        logger.debug(f"Credentials saved to SQLite key: {self._sqlite_token_key} (merged)")
+                        return
+                    if self._last_write_conflict:
+                        # Another process rotated the credential underneath us.
+                        # Do NOT clobber it - roll back and adopt what is on disk.
+                        conn.rollback()
+                        conn.close()
+                        logger.warning(
+                            "Aborted SQLite write-back: the stored refresh token changed "
+                            "underneath us (concurrent refresher). Reloading credentials."
+                        )
+                        self._load_credentials_from_sqlite(self._sqlite_db)
+                        return
                     logger.warning(f"Failed to save to primary key: {self._sqlite_token_key}, trying fallback")
-            
-            # Fallback: try all keys (for edge cases where source key is unknown or deleted)
-            for key in SQLITE_TOKEN_KEYS:
-                if self._try_save_to_key(cursor, key):
-                    conn.commit()
+                
+                # Fallback: try all keys (for edge cases where source key is unknown or deleted)
+                for key in SQLITE_TOKEN_KEYS:
+                    if self._try_save_to_key(cursor, key):
+                        conn.commit()
+                        conn.close()
+                        logger.debug(f"Credentials saved to SQLite key: {key} (fallback, merged)")
+                        return
+                    if self._last_write_conflict:
+                        conn.rollback()
+                        conn.close()
+                        logger.warning(
+                            "Aborted SQLite write-back: the stored refresh token changed "
+                            "underneath us (concurrent refresher). Reloading credentials."
+                        )
+                        self._load_credentials_from_sqlite(self._sqlite_db)
+                        return
+                
+                # If we get here, no keys were updated
+                conn.rollback()
+                conn.close()
+                logger.warning(f"Failed to save credentials to SQLite: no matching keys found")
+            except Exception:
+                try:
+                    conn.rollback()
+                finally:
                     conn.close()
-                    logger.debug(f"Credentials saved to SQLite key: {key} (fallback, merged)")
-                    return
-            
-            # If we get here, no keys were updated
-            conn.close()
-            logger.warning(f"Failed to save credentials to SQLite: no matching keys found")
+                raise
             
         except sqlite3.Error as e:
             logger.error(f"SQLite error saving credentials: {e}")
@@ -583,10 +717,16 @@ class KiroAuthManager:
     
     def _try_save_to_key(self, cursor: sqlite3.Cursor, key: str) -> bool:
         """
-        Attempts to save credentials to a specific SQLite key using read-merge-write.
+        Attempts to save credentials to a specific SQLite key using read-merge-write
+        with a compare-and-set predicate (Issue #203).
+        
+        The UPDATE only applies if the row still holds exactly the value we merged
+        from, and the merge is refused outright if the stored refresh token is no
+        longer the one we loaded (i.e. another process rotated it). In that case
+        `self._last_write_conflict` is set to True and nothing is written.
         
         Args:
-            cursor: SQLite cursor
+            cursor: SQLite cursor (must already be inside a write transaction)
             key: SQLite key to save to
         
         Returns:
@@ -600,11 +740,30 @@ class KiroAuthManager:
             if not row:
                 return False
             
+            previous_value = row[0]
+            
             # Parse existing JSON
             try:
-                existing_data = json.loads(row[0])
+                existing_data = json.loads(previous_value)
             except json.JSONDecodeError as e:
                 logger.warning(f"Failed to parse JSON for key {key}, skipping: {e}")
+                return False
+            
+            # Compare-and-set guard: refuse to overwrite a refresh token that some
+            # other process rotated after we loaded ours. Never log token values.
+            stored_refresh_token = existing_data.get("refresh_token")
+            if (
+                key == self._sqlite_token_key
+                and self._loaded_refresh_token is not None
+                and stored_refresh_token is not None
+                and stored_refresh_token != self._loaded_refresh_token
+                and stored_refresh_token != self._refresh_token
+            ):
+                self._last_write_conflict = True
+                logger.warning(
+                    f"Refusing to overwrite SQLite key {key}: stored refresh token "
+                    "was rotated by another process since it was loaded"
+                )
                 return False
             
             # Merge: update ONLY our fields, preserve EVERYTHING else
@@ -619,13 +778,20 @@ class KiroAuthManager:
             
             token_json = json.dumps(existing_data)
             
-            # Write back merged data
+            # Write back merged data, conditional on the row being unchanged
             cursor.execute(
-                "UPDATE auth_kv SET value = ? WHERE key = ?",
-                (token_json, key)
+                "UPDATE auth_kv SET value = ? WHERE key = ? AND value = ?",
+                (token_json, key, previous_value)
             )
             
-            return cursor.rowcount > 0
+            if cursor.rowcount > 0:
+                self._loaded_refresh_token = self._refresh_token
+                return True
+            
+            # Row changed between our SELECT and UPDATE - treat as a conflict
+            self._last_write_conflict = True
+            logger.warning(f"Compare-and-set failed for SQLite key {key}: row changed concurrently")
+            return False
             
         except Exception as e:
             logger.debug(f"Failed to save to key {key}: {e}")
@@ -672,10 +838,19 @@ class KiroAuthManager:
         - KIRO_DESKTOP: Uses Kiro Desktop Auth endpoint
         - AWS_SSO_OIDC: Uses AWS SSO OIDC endpoint
         
+        Issue #203: before spending our (single-use, rotating) refresh token, re-read
+        the credential store. If another process already rotated it, adopt the on-disk
+        credential rather than burning - and thereby revoking - a stale one.
+        
         Raises:
             ValueError: If refresh token is not set or response doesn't contain accessToken
             httpx.HTTPError: On HTTP request error
         """
+        if self._adopt_on_disk_credentials_if_changed():
+            if self._access_token and not self.is_token_expiring_soon():
+                logger.info("Adopted fresh credentials from disk; skipping token refresh")
+                return
+        
         if self._auth_type == AuthType.AWS_SSO_OIDC:
             await self._refresh_token_aws_sso_oidc()
         else:
