@@ -225,6 +225,32 @@ Reasoning is off by default. Enabling it sets `reasoning` plus
 `interleaved.field: reasoning_content`, which the gateway does emit, but OpenCode was observed
 to report zero reasoning tokens for it. It is harmless and currently has no effect.
 
+### Grok Build
+
+xAI's [Grok Build](https://x.ai/cli) CLI supports a custom OpenAI-compatible backend, so it can
+run against the gateway with no xAI subscription. Setting a custom models endpoint switches it to
+API-key auth, so `grok login` is not needed.
+
+```bash
+export KIRO_GATEWAY_KEY=pick-your-own-secret
+
+python grok-build/grok_build_config.py setup --url http://localhost:8000 --write
+grok -p "Explain this repo"
+```
+
+That merges the gateway's sections into `~/.grok/config.toml`: an `[endpoints] models_base_url`
+pointing at the gateway, and a `[model."<id>"]` table per model with its real context window.
+`setup`, `doctor` and `update` behave the same as the OpenCode helper, including the dry-run
+default and `--write` backups, and only the sections the gateway owns are rewritten.
+
+> [!IMPORTANT]
+> Grok Build uses separate models for auxiliary work: session titles, image descriptions and web
+> search. If those are left unset it falls back to its own xAI model, and every session fires a
+> request that the gateway cannot serve. The generated config pins all of them, choosing the
+> cheapest available model by rate multiplier for throwaway work like session titles.
+
+Check what Grok actually resolved with `grok models` and `grok inspect`.
+
 ### Endpoints
 
 | Method | Path | Purpose |
@@ -234,6 +260,7 @@ to report zero reasoning tokens for it. It is harmless and currently has no effe
 | `POST` | `/v1/messages/count_tokens` | Anthropic token estimation |
 | `GET` | `/v1/models` | Models available to the active account, with limits and rate info |
 | `GET` | `/integrations/opencode.json` | Ready-to-merge OpenCode provider config |
+| `GET` | `/integrations/grok-build.toml` | Ready-to-merge Grok Build config |
 | `GET` | `/health` | Liveness check |
 | `GET` | `/docs` | Interactive OpenAPI documentation |
 
