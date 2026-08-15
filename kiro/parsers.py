@@ -583,3 +583,379 @@ class AwsEventStreamParser:
         self.last_content = None
         self.current_tool_call = None
         self.tool_calls = []
+
+
+
+# ==================================================================================================
+# Real event-stream framing (RECOMMENDATION 1)
+# ==================================================================================================
+
+# Maps the `:event-type` header of a decoded frame onto the internal event
+# vocabulary that `AwsEventStreamParser` already produces, so that every
+# downstream converter (streaming_anthropic, streaming_openai) is unchanged.
+#
+# Both spellings are listed because the wire has been observed carrying the
+# Smithy camelCase names and the Rust snake_case variants.
+#
+#   assistantResponseEvent -> content
+#   toolUseEvent           -> tool_start / tool_input / tool_stop (payload-shaped)
+#   messageMetadata        -> usage / context_usage / metadata
+#   followupPrompt         -> followup
+#
+# Anything not listed here (invalidStateEvent, codeReferenceEvent,
+# reasoningContentEvent, ...) is surfaced verbatim as an "unknown_event", and
+# frames whose `:message-type` is not `event` are surfaced as "exception".
+# See EventStreamRoutingParser._route_frame for that extension point.
+FRAME_EVENT_TYPE_MAP: Dict[str, str] = {
+    "assistantResponseEvent": "content",
+    "assistant_response_event": "content",
+    "toolUseEvent": "tool_use",
+    "tool_use_event": "tool_use",
+    "messageMetadata": "metadata",
+    "messageMetadataEvent": "metadata",
+    "message_metadata_event": "metadata",
+    "followupPrompt": "followup",
+    "followupPromptEvent": "followup",
+    "followup_prompt_event": "followup",
+}
+
+
+class EventStreamRoutingParser:
+    """
+    Stream parser that decodes real AWS event-stream frames and routes them on
+    the ``:event-type`` header, with the legacy prefix-scraping parser as an
+    always-live automatic fallback.
+
+    Interface-compatible with :class:`AwsEventStreamParser` (``feed``,
+    ``get_tool_calls``, ``reset``), so ``streaming_core`` can use either.
+
+    Two modes, decided from the first bytes of the stream and logged once:
+
+    - ``framed``: the head of the stream is a CRC-valid event-stream prelude.
+      Frames are reassembled across chunk boundaries, both CRC32s are checked,
+      and payloads are routed by header.
+    - ``legacy``: the stream is not framed (or ``EVENTSTREAM_DECODER=false``, or
+      framing turned out to be corrupt mid-stream). Every buffered byte is
+      handed to :class:`AwsEventStreamParser` unchanged.
+
+    Tool-call accumulation is *always* delegated to the embedded legacy parser,
+    so the dict-merge-vs-string-concat semantics from FIX-03 are shared verbatim
+    by both paths.
+    """
+
+    def __init__(self, enabled: Optional[bool] = None):
+        """
+        Args:
+            enabled: Force the decoder on/off. When None, reads
+                ``kiro.config.EVENTSTREAM_DECODER`` (read at construction time so
+                tests can patch the module attribute).
+        """
+        if enabled is None:
+            from kiro import config as _config
+            enabled = bool(getattr(_config, "EVENTSTREAM_DECODER", True))
+
+        self._decoder_enabled = enabled
+        self._legacy = AwsEventStreamParser()
+        self._decoder: Optional[Any] = None
+        self._pending_legacy: bytes = b""
+        # None = undecided, "framed" / "legacy" once resolved.
+        self.mode: Optional[str] = None
+        self._logged_mode = False
+
+        if enabled:
+            from kiro.eventstream import EventStreamDecoder
+            self._decoder = EventStreamDecoder()
+        else:
+            self._set_mode("legacy", "EVENTSTREAM_DECODER=false")
+
+    # ------------------------------------------------------------------ state
+
+    def _set_mode(self, mode: str, reason: str) -> None:
+        """Record the chosen path and log it once per stream at DEBUG."""
+        self.mode = mode
+        if not self._logged_mode:
+            self._logged_mode = True
+            logger.debug(f"Kiro stream parse path: {mode} ({reason})")
+
+    def _fall_back(self, reason: str, pending: bytes) -> None:
+        """Switch permanently to the legacy parser, keeping undecoded bytes."""
+        if self.mode != "legacy":
+            if self._logged_mode:
+                logger.warning(f"Kiro stream falling back to legacy parsing: {reason}")
+            self._logged_mode = False
+            self._set_mode("legacy", reason)
+        self._decoder = None
+        self._pending_legacy = pending
+
+    # ------------------------------------------------------------------- feed
+
+    def feed(self, chunk: bytes) -> List[Dict[str, Any]]:
+        """
+        Adds a chunk and returns parsed events.
+
+        Args:
+            chunk: Raw bytes from the stream.
+
+        Returns:
+            List of ``{"type": str, "data": Any}`` events, in the same vocabulary
+            the legacy parser produces (plus the passthrough types documented on
+            :meth:`_route_frame`).
+        """
+        if self.mode == "legacy" or self._decoder is None:
+            pending = getattr(self, "_pending_legacy", b"")
+            if pending:
+                self._pending_legacy = b""
+                chunk = pending + (chunk or b"")
+            return self._legacy.feed(chunk or b"")
+
+        self._decoder.feed(chunk or b"")
+
+        # Resolve framing on the very first bytes. `None` means we do not have
+        # enough bytes to tell yet - keep buffering rather than guessing.
+        if self.mode is None:
+            probe = self._decoder.looks_like_eventstream()
+            if probe is None:
+                return []
+            if probe is False:
+                self._fall_back_initial()
+                pending = self._pending_legacy
+                self._pending_legacy = b""
+                return self._legacy.feed(pending)
+            self._set_mode("framed", "valid event-stream prelude")
+
+        events: List[Dict[str, Any]] = []
+        while True:
+            try:
+                frame = self._decoder.next_frame()
+            except Exception as e:
+                # Corrupt framing. Everything still buffered is handed to the
+                # legacy parser rather than failing the request.
+                pending = self._decoder.take_buffer() if self._decoder else b""
+                self._fall_back(f"frame decode error: {e}", b"")
+                events.extend(self._legacy.feed(pending))
+                return events
+
+            if frame is None:
+                break
+
+            events.extend(self._route_frame(frame))
+
+        return events
+
+    def _fall_back_initial(self) -> None:
+        """Stream is not framed at all: legacy from the first byte."""
+        pending = self._decoder.take_buffer() if self._decoder else b""
+        self._set_mode("legacy", "stream is not event-stream framed")
+        self._decoder = None
+        self._pending_legacy = pending
+
+    def flush(self) -> List[Dict[str, Any]]:
+        """
+        Drains anything still buffered at end of stream.
+
+        A stream shorter than a prelude never resolves its mode; on completion
+        those bytes are given to the legacy parser so nothing is lost.
+        """
+        if self._decoder is None:
+            pending = getattr(self, "_pending_legacy", b"")
+            if pending:
+                self._pending_legacy = b""
+                return self._legacy.feed(pending)
+            return []
+
+        if self.mode is None:
+            self._fall_back_initial()
+            return self.flush()
+
+        # Framed mode with leftover bytes: a truncated trailing frame. The real
+        # client calls this "data left over in the event stream response stream".
+        leftover = self._decoder.buffered_bytes
+        if leftover:
+            logger.warning(
+                f"Event stream ended with {leftover} undecoded trailing byte(s) "
+                "(truncated frame); discarding"
+            )
+            self._decoder.take_buffer()
+        return []
+
+    # ---------------------------------------------------------------- routing
+
+    def _route_frame(self, frame: Any) -> List[Dict[str, Any]]:
+        """
+        Turns one decoded frame into zero or more internal events.
+
+        EXTENSION POINT for exception / invalidState handling: the two branches
+        below emit ``{"type": "exception", ...}`` for any frame whose
+        ``:message-type`` is not ``event``, and ``{"type": "unknown_event", ...}``
+        for any unmapped ``:event-type`` (invalidStateEvent, reasoningContentEvent,
+        codeReferenceEvent, ...). Both carry the full ``headers`` dict, the raw
+        ``payload`` bytes and the parsed ``data`` when the payload is JSON, so a
+        follow-up change can act on them without touching the decoder or the
+        routing table. ``streaming_core._process_chunk`` currently ignores both
+        types, which keeps today's behaviour byte-identical.
+
+        Args:
+            frame: An :class:`kiro.eventstream.EventStreamFrame`.
+
+        Returns:
+            List of internal events.
+        """
+        message_type = frame.message_type
+        event_type = frame.event_type
+        data = self._parse_payload(frame)
+
+        # --- exception / error frames (in-band) -------------------------------
+        if (message_type is not None and message_type != "event") or frame.exception_type:
+            return [{
+                "type": "exception",
+                "data": data,
+                "headers": dict(frame.headers),
+                "message_type": message_type,
+                "exception_type": frame.exception_type,
+                "payload": frame.payload,
+            }]
+
+        internal = FRAME_EVENT_TYPE_MAP.get(event_type or "")
+
+        # --- unmapped event types --------------------------------------------
+        if internal is None:
+            return [{
+                "type": "unknown_event",
+                "data": data,
+                "headers": dict(frame.headers),
+                "event_type": event_type,
+                "payload": frame.payload,
+            }]
+
+        if not isinstance(data, dict):
+            logger.debug(f"Frame '{event_type}' payload is not a JSON object; ignoring")
+            return []
+
+        if internal == "content":
+            return self._route_content(data)
+        if internal == "tool_use":
+            return self._route_tool_use(data)
+        if internal == "metadata":
+            return self._route_metadata(data, frame)
+        if internal == "followup":
+            return [{"type": "followup", "data": data.get("followupPrompt", data)}]
+
+        return []
+
+    @staticmethod
+    def _parse_payload(frame: Any) -> Any:
+        """Parse a frame payload as JSON, or return the decoded text on failure."""
+        if not frame.payload:
+            return None
+        text = frame.payload_text()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            logger.debug(f"Frame payload is not JSON: {text[:120]}")
+            return text
+
+    def _route_content(self, data: dict) -> List[Dict[str, Any]]:
+        """assistantResponseEvent -> content (or followup)."""
+        # A followup prompt can ride inside an assistant response payload.
+        if data.get("followupPrompt"):
+            return [{"type": "followup", "data": data["followupPrompt"]}]
+
+        content = data.get("content")
+        if not content:
+            return []
+        # NOTE: no adjacent-duplicate suppression here, unlike the legacy path.
+        # That suppression exists only because prefix scraping could observe the
+        # same JSON twice; framing delivers each payload exactly once, so
+        # dropping a legitimately repeated token would lose real output.
+        return [{"type": "content", "data": content}]
+
+    def _route_tool_use(self, data: dict) -> List[Dict[str, Any]]:
+        """
+        toolUseEvent -> the tool_start / tool_input / tool_stop sequence.
+
+        Routed through the embedded legacy parser's handlers so the FIX-03
+        accumulation semantics (dict merge vs string concat) are literally the
+        same code on both paths. Those handlers return None by design - completed
+        tool calls are collected via ``get_tool_calls()``.
+        """
+        # Upstream repeats `name` and `toolUseId` in EVERY toolUseEvent frame, and
+        # streams `input` as successive partial-JSON string fragments. Routing on
+        # the presence of `name` therefore re-started the tool call on every
+        # fragment and discarded the accumulated arguments. Route on toolUseId
+        # identity instead: a frame starts a new call only when no call is open or
+        # when it belongs to a different toolUseId.
+        tool_use_id = data.get("toolUseId")
+        current = self._legacy.current_tool_call
+        current_id = current.get("id") if current else None
+
+        is_new_call = current is None or (
+            bool(tool_use_id) and tool_use_id != current_id
+        )
+
+        if is_new_call and (data.get("name") or current is not None):
+            # Start finalises any previous call and absorbs `input` / `stop`
+            # carried in the same frame (name+input+stop is legal).
+            self._legacy._process_tool_start_event(data)
+            return []
+
+        # Continuation of the open call: an `input` fragment is always accumulated,
+        # even when `name` rides along. Empty strings are ignored by the handler.
+        if "input" in data:
+            self._legacy._process_tool_input_event(data)
+
+        if data.get("stop"):
+            self._legacy._process_tool_stop_event(data)
+
+        return []
+
+    def _route_metadata(self, data: dict, frame: Any) -> List[Dict[str, Any]]:
+        """messageMetadataEvent -> usage / context_usage / metadata passthrough."""
+        events: List[Dict[str, Any]] = []
+
+        if "usage" in data:
+            events.append({"type": "usage", "data": data.get("usage", 0)})
+        if "contextUsagePercentage" in data:
+            events.append({
+                "type": "context_usage",
+                "data": data.get("contextUsagePercentage", 0),
+            })
+
+        if not events:
+            # conversationId / messageId and friends. Ignored downstream today;
+            # kept as a distinct type so it is available without re-plumbing.
+            events.append({
+                "type": "metadata",
+                "data": data,
+                "headers": dict(frame.headers),
+            })
+
+        return events
+
+    # ----------------------------------------------------------- tool results
+
+    def get_tool_calls(self) -> List[Dict[str, Any]]:
+        """Returns all collected tool calls (delegated to the legacy accumulator)."""
+        return self._legacy.get_tool_calls()
+
+    def reset(self) -> None:
+        """Resets all parser state."""
+        self._legacy.reset()
+        self._pending_legacy = b""
+        self.mode = None
+        self._logged_mode = False
+        if self._decoder_enabled:
+            from kiro.eventstream import EventStreamDecoder
+            self._decoder = EventStreamDecoder()
+        else:
+            self._decoder = None
+            self._set_mode("legacy", "EVENTSTREAM_DECODER=false")
+
+    # Convenience passthroughs so callers that poked at the legacy parser's
+    # attributes keep working.
+    @property
+    def tool_calls(self) -> List[Dict[str, Any]]:
+        return self._legacy.tool_calls
+
+    @property
+    def current_tool_call(self) -> Optional[Dict[str, Any]]:
+        return self._legacy.current_tool_call

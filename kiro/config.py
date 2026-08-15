@@ -513,6 +513,25 @@ TOOL_DESCRIPTION_MAX_LENGTH: int = int(os.getenv("TOOL_DESCRIPTION_MAX_LENGTH", 
 # Default: true (enabled)
 TRUNCATION_RECOVERY: bool = os.getenv("TRUNCATION_RECOVERY", "true").lower() in ("true", "1", "yes")
 
+# ==================================================================================================
+# Event Stream Decoder Settings
+# ==================================================================================================
+
+# Decode real AWS event-stream frames (prelude, both CRC32s, headers) and route
+# on the `:event-type` header, instead of scraping JSON substrings out of the
+# raw byte stream.
+#
+# Default: true.
+#
+# The legacy prefix-matching parser is ALWAYS live as an automatic fallback: if
+# the upstream byte stream does not present valid framing (or framing turns out
+# to be corrupt mid-stream), the gateway silently reverts to it for the rest of
+# that stream. Setting this to false forces the legacy path from the first byte
+# and is intended purely as an escape hatch.
+EVENTSTREAM_DECODER: bool = os.getenv("EVENTSTREAM_DECODER", "true").lower() not in (
+    "false", "0", "no", "off", "disabled"
+)
+
 # Enable a single mid-stream continuation attempt when the upstream stream drops
 # mid-response (issue #129).
 #
@@ -705,6 +724,35 @@ AUTO_TRIM_PAYLOAD: bool = os.getenv("AUTO_TRIM_PAYLOAD", "false").lower() in ("t
 #
 # Note: Native Anthropic server-side tools (Path A) work ALWAYS, regardless of this setting
 WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "true").lower() in ("true", "1", "yes")
+
+# ==================================================================================================
+# Client Identity Settings (on-the-wire fidelity with the real kiro-cli)
+# ==================================================================================================
+
+# Value for the x-amzn-kiro-agent-mode header.
+#
+# These are the only three values the real kiro-cli binary sends on the wire
+# (confirmed string literals in /home/prism/.local/bin/kiro-cli-chat):
+#   kiro_default, kiro_planner, kiro_spec
+#
+# NOTE: "vibe" is a UI-only label. The client's own mapping functions convert
+# "default" <-> "vibe" above the API boundary, so "vibe" must never be sent.
+#
+# An unrecognised value falls back to "kiro_default".
+KIRO_AGENT_MODES: List[str] = ["kiro_default", "kiro_planner", "kiro_spec"]
+_KIRO_AGENT_MODE_RAW: str = os.getenv("KIRO_AGENT_MODE", "kiro_default").strip()
+if _KIRO_AGENT_MODE_RAW in KIRO_AGENT_MODES:
+    KIRO_AGENT_MODE: str = _KIRO_AGENT_MODE_RAW
+else:
+    KIRO_AGENT_MODE: str = "kiro_default"
+
+# Value for the x-amzn-codewhisperer-optout header (default: true).
+#
+# DELIBERATE DIVERGENCE FROM THE REAL CLIENT. The real client sends "false".
+# "true" opts the user OUT of having their content used for service improvement,
+# and the gateway will not silently opt users in for the sake of fidelity.
+# Set CODEWHISPERER_OPTOUT=false to match the real client exactly.
+CODEWHISPERER_OPTOUT: bool = os.getenv("CODEWHISPERER_OPTOUT", "true").lower() in ("true", "1", "yes")
 
 # ==================================================================================================
 # Account System Settings

@@ -37,7 +37,12 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Awaitable, Dict
 import httpx
 from loguru import logger
 
-from kiro.parsers import AwsEventStreamParser, parse_bracket_tool_calls, deduplicate_tool_calls
+from kiro.parsers import (
+    AwsEventStreamParser,
+    EventStreamRoutingParser,
+    parse_bracket_tool_calls,
+    deduplicate_tool_calls,
+)
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
@@ -45,7 +50,13 @@ from kiro.config import (
     FAKE_REASONING_HANDLING,
 )
 from kiro.thinking_parser import ThinkingParser
-from kiro.network_errors import is_transport_drop_error, describe_transport_drop
+from kiro.network_errors import (
+    is_transport_drop_error,
+    describe_transport_drop,
+    describe_midstream_failure,
+    classify_stream_failure_frame,
+    UpstreamStreamException,
+)
 
 if TYPE_CHECKING:
     from kiro.cache import ModelInfoCache
@@ -138,7 +149,7 @@ async def parse_kiro_stream(
     Raises:
         FirstTokenTimeoutError: If first token not received within timeout
     """
-    parser = AwsEventStreamParser()
+    parser = EventStreamRoutingParser()
     first_token_received = False
     
     # Initialize thinking parser if fake reasoning is enabled
@@ -184,6 +195,10 @@ async def parse_kiro_stream(
             async for event in _process_chunk(parser, chunk, thinking_parser):
                 yield event
         
+        # Drain anything still buffered (undersized stream, truncated trailing frame)
+        async for event in _process_events(parser.flush(), thinking_parser):
+            yield event
+        
         # Finalize thinking parser and yield any remaining content
         if thinking_parser:
             final_result = thinking_parser.finalize()
@@ -224,6 +239,10 @@ async def parse_kiro_stream(
     except asyncio.CancelledError:
         # Task cancellation must always propagate - swallowing it hangs the ASGI task
         raise
+    except UpstreamStreamException:
+        # Already logged at WARNING where it was classified. Re-raised so the
+        # formatting layer can close the stream out with a visible error.
+        raise
     except Exception as e:
         error_type = type(e).__name__
         error_msg = str(e) if str(e) else "(empty message)"
@@ -246,15 +265,37 @@ async def _process_chunk(
     Process a single chunk from Kiro stream.
     
     Args:
-        parser: AWS event stream parser
+        parser: Stream parser (EventStreamRoutingParser or legacy AwsEventStreamParser)
         chunk: Raw bytes chunk
         thinking_parser: Optional thinking parser for fake reasoning
     
     Yields:
         KiroEvent objects
     """
-    events = parser.feed(chunk)
+    async for event in _process_events(parser.feed(chunk), thinking_parser):
+        yield event
+
+
+async def _process_events(
+    events: List[Dict[str, Any]],
+    thinking_parser: Optional[ThinkingParser]
+) -> AsyncGenerator[KiroEvent, None]:
+    """
+    Convert internal parser events into KiroEvent objects.
     
+    Event types not handled here (followup, metadata) are intentionally ignored.
+    ``exception`` frames and ``invalidState`` ``unknown_event`` frames are raised
+    as :class:`kiro.network_errors.UpstreamStreamException` so the formatting layer
+    can close the client stream out with a visible error; all other
+    ``unknown_event`` types stay ignored.
+    
+    Args:
+        events: Internal events from the parser
+        thinking_parser: Optional thinking parser for fake reasoning
+    
+    Yields:
+        KiroEvent objects
+    """
     for event in events:
         if event["type"] == "content":
             content = event["data"]
@@ -290,6 +331,20 @@ async def _process_chunk(
         
         elif event["type"] == "context_usage":
             yield KiroEvent(type="context_usage", context_usage_percentage=event["data"])
+        
+        elif event["type"] in ("exception", "unknown_event"):
+            # Application-level failure frames (RECOMMENDATION 2). The transport is
+            # healthy; upstream deliberately sent an exception / invalidState frame.
+            # Previously these matched nothing and the stream just ended, so the
+            # client saw a silently truncated answer with no error.
+            failure = classify_stream_failure_frame(event)
+            if failure is None:
+                # Benign unmapped event (reasoningContentEvent, codeReferenceEvent,
+                # ...): keep ignoring it, exactly as before.
+                continue
+            # Upstream behaviour, not a gateway bug. Never logs payload bytes.
+            logger.warning(f"Kiro stream: {describe_midstream_failure(failure)}")
+            raise failure
 
 
 # ==================================================================================================
