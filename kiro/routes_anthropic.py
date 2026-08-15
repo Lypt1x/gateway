@@ -34,7 +34,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from loguru import logger
 
-from kiro.config import PROXY_API_KEY, PROFILE_ARN
+from kiro.config import (
+    PROXY_API_KEY,
+    PROXY_API_KEYS,
+    PROFILE_ARN,
+    configured_proxy_api_key_count,
+    verify_proxy_api_key,
+    verify_proxy_bearer_token,
+)
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicCountTokensRequest,
@@ -44,7 +51,7 @@ from kiro.models_anthropic import (
 )
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
-from kiro.converters_anthropic import anthropic_to_kiro
+from kiro.converters_anthropic import anthropic_to_kiro, normalize_inline_system_messages
 from kiro.streaming_anthropic import (
     stream_kiro_to_anthropic,
     collect_anthropic_response,
@@ -92,14 +99,17 @@ async def verify_anthropic_api_key(
         HTTPException: 401 if key is invalid or missing
     """
     # Check x-api-key first (Anthropic native)
-    if x_api_key and x_api_key == PROXY_API_KEY:
+    if verify_proxy_api_key(x_api_key):
         return True
     
     # Fall back to Authorization: Bearer
-    if authorization and authorization == f"Bearer {PROXY_API_KEY}":
+    if verify_proxy_bearer_token(authorization):
         return True
     
-    logger.warning("Access attempt with invalid API key (Anthropic endpoint)")
+    logger.warning(
+        "Access attempt with invalid API key (Anthropic endpoint) "
+        f"({configured_proxy_api_key_count()} key(s) configured)"
+    )
     raise HTTPException(
         status_code=401,
         detail={
@@ -934,15 +944,25 @@ async def count_tokens_endpoint(
     """
     logger.info(f"Request to /v1/messages/count_tokens (model={request_data.model}, messages={len(request_data.messages)})")
     
+    # Apply the SAME normalization as the real /v1/messages path (issue #255): clients may
+    # place system instructions inline as role="system" messages. Without hoisting them the
+    # estimate would count a different message set than the one actually sent upstream.
+    normalized_messages, merged_system = normalize_inline_system_messages(
+        request_data.messages,
+        request_data.system,
+    )
+    
     # Prepare data for tokenizer (same format as streaming message_start)
-    messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
+    messages_for_tokenizer = [
+        msg if isinstance(msg, dict) else msg.model_dump() for msg in normalized_messages
+    ]
     tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
     
     # Handle system prompt (can be string or list of content blocks)
-    if isinstance(request_data.system, list):
-        system_for_tokenizer = [b.model_dump() if hasattr(b, "model_dump") else b for b in request_data.system]
+    if isinstance(merged_system, list):
+        system_for_tokenizer = [b.model_dump() if hasattr(b, "model_dump") else b for b in merged_system]
     else:
-        system_for_tokenizer = request_data.system
+        system_for_tokenizer = merged_system
     
     # Use the SAME estimation logic as Anthropic streaming message_start
     request_token_stats = estimate_request_tokens(

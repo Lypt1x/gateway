@@ -36,6 +36,9 @@ from loguru import logger
 
 from kiro.config import (
     PROXY_API_KEY,
+    PROXY_API_KEYS,
+    configured_proxy_api_key_count,
+    verify_proxy_bearer_token,
     APP_VERSION,
     PROFILE_ARN,
 )
@@ -80,8 +83,10 @@ async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
     Raises:
         HTTPException: 401 if key is invalid or missing
     """
-    if not auth_header or auth_header != f"Bearer {PROXY_API_KEY}":
-        logger.warning("Access attempt with invalid API key.")
+    if not verify_proxy_bearer_token(auth_header):
+        logger.warning(
+            f"Access attempt with invalid API key. ({configured_proxy_api_key_count()} key(s) configured)"
+        )
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
     return True
 

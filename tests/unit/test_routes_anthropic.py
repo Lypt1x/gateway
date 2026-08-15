@@ -339,10 +339,12 @@ class TestMessagesValidation:
     
     def test_validates_invalid_role(self, test_client, valid_proxy_api_key):
         """
-        What it does: Verifies invalid message role is rejected.
-        Purpose: Anthropic model strictly validates role (only 'user' or 'assistant').
+        What it does: Verifies a non-standard message role is accepted (not 422).
+        Purpose: FIX-01 — clients send inline 'system' (and other) roles inside
+        `messages`; validation must not hard-fail. Non-standard roles are
+        normalized to 'user' by normalize_inline_system_messages().
         """
-        print("Action: POST /v1/messages with invalid role...")
+        print("Action: POST /v1/messages with non-standard role...")
         response = test_client.post(
             "/v1/messages",
             headers={"x-api-key": valid_proxy_api_key},
@@ -354,8 +356,8 @@ class TestMessagesValidation:
         )
         
         print(f"Status: {response.status_code}")
-        # Anthropic model strictly validates role - only 'user' or 'assistant' allowed
-        assert response.status_code == 422
+        # FIX-01: role is no longer a hard Literal; must not be a validation error
+        assert response.status_code != 422
     
     def test_accepts_valid_request_format(self, test_client, valid_proxy_api_key):
         """
