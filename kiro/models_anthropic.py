@@ -103,7 +103,17 @@ class ToolResultContentBlock(BaseModel):
     type: Literal["tool_result"] = "tool_result"
     tool_use_id: str
     content: Optional[
-        Union[str, List[Union["TextContentBlock", "ImageContentBlock", "ToolReferenceContentBlock"]]]
+        Union[
+            str,
+            List[
+                Union[
+                    "TextContentBlock",
+                    "ImageContentBlock",
+                    "DocumentContentBlock",
+                    "ToolReferenceContentBlock",
+                ]
+            ],
+        ]
     ] = None
     is_error: Optional[bool] = None
 
@@ -162,15 +172,105 @@ class ImageContentBlock(BaseModel):
     source: Union[Base64ImageSource, URLImageSource]
 
 
+# ==================================================================================================
+# Document Content Block Models
+# ==================================================================================================
+
+
+class Base64DocumentSource(BaseModel):
+    """
+    Base64-encoded document source in Anthropic format.
+
+    Attributes:
+        type: Always "base64"
+        media_type: MIME type (e.g., "application/pdf", "text/plain")
+        data: Base64-encoded document data
+    """
+
+    type: Literal["base64"] = "base64"
+    media_type: str = "application/pdf"
+    data: str = ""
+
+    model_config = {"extra": "allow"}
+
+
+class URLDocumentSource(BaseModel):
+    """
+    URL-based document source in Anthropic format.
+
+    Attributes:
+        type: Always "url"
+        url: HTTP(S) URL to the document
+    """
+
+    type: Literal["url"] = "url"
+    url: str = ""
+
+    model_config = {"extra": "allow"}
+
+
+class PlainTextDocumentSource(BaseModel):
+    """
+    Inline plain-text document source in Anthropic format.
+
+    Anthropic also allows ``{"type": "text", "media_type": "text/plain",
+    "data": "..."}`` for documents whose content is already text.
+    """
+
+    type: Literal["text"] = "text"
+    media_type: str = "text/plain"
+    data: str = ""
+
+    model_config = {"extra": "allow"}
+
+
+class DocumentContentBlock(BaseModel):
+    """
+    Document content block in Anthropic format (e.g. a PDF attachment).
+
+    UPSTREAM LIMITATION (issue #176): the Kiro / CodeWhisperer
+    ``generateAssistantResponse`` payload has no document channel at all. Its
+    only binary attachment slot is ``userInputMessage.images``, which accepts
+    image formats only (see converters_core.convert_images_to_kiro_format).
+    Documents therefore CANNOT be forwarded as bytes. Accepting this block here
+    exists to stop the hard HTTP 422 described in issue #176; the converter
+    degrades the block to inline text (real text for text-like media types, an
+    explicit placeholder otherwise). See
+    converters_anthropic.extract_documents_from_content.
+
+    Attributes:
+        type: Always "document"
+        source: Document source (base64, url, or inline text)
+        title: Optional document title supplied by the client
+        context: Optional client-supplied context string
+    """
+
+    type: Literal["document"] = "document"
+    source: Union[Base64DocumentSource, URLDocumentSource, PlainTextDocumentSource, Dict[str, Any]]
+    title: Optional[str] = None
+    context: Optional[str] = None
+
+    model_config = {"extra": "allow"}
+
+
 # Union type for all content blocks (including images and thinking)
 ContentBlock = Union[
     TextContentBlock,
     ThinkingContentBlock,
     ImageContentBlock,
+    DocumentContentBlock,
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
 ]
+
+
+# ToolResultContentBlock.content references "ImageContentBlock" (defined above, but *after* the
+# reference site) as a string forward ref. Pydantic v2 resolves such refs lazily on first
+# validation, so this is not required for correctness today; rebuilding explicitly here makes
+# resolution deterministic and independent of import order or of schema generation happening
+# before module import completes (which would raise PydanticUndefinedAnnotation).
+ToolResultContentBlock.model_rebuild()
 
 
 # ==================================================================================================
@@ -183,11 +283,17 @@ class AnthropicMessage(BaseModel):
     Message in Anthropic format.
 
     Attributes:
-        role: Message role (user or assistant)
+        role: Message role. Documented values are "user" and "assistant", but any
+            string is accepted for client compatibility. Some clients (e.g. Claude
+            Code) place a {"role": "system"} entry inside `messages` instead of
+            using the top-level `system` field; rejecting it at validation time
+            would fail the request with HTTP 422 before any converter runs.
+            Non-standard roles are normalized later by
+            kiro.converters_anthropic.normalize_inline_system_messages().
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    role: str
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}

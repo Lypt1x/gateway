@@ -24,6 +24,7 @@ This module is an adapter layer that converts Anthropic-specific formats
 to the unified format used by converters_core.py.
 """
 
+import base64
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -113,6 +114,223 @@ def extract_system_prompt(system: Any) -> str:
     return str(system)
 
 
+def normalize_inline_system_messages(
+    messages: List[AnthropicMessage],
+    system: Any = None,
+) -> tuple:
+    """
+    Hoists inline ``role == "system"`` messages out of ``messages``.
+
+    Some clients place system instructions inside the ``messages`` array instead
+    of using the top-level ``system`` field. Such messages are removed from the
+    conversation and merged into the effective system prompt **before** the
+    top-level ``system`` content, preserving their relative order. Any remaining
+    non-standard role (e.g. ``"tool"``, ``"developer"``) is coerced to ``"user"``
+    so the turn is kept rather than dropped.
+
+    Both content shapes are supported: a plain string or a list of content
+    blocks (dicts or Pydantic models).
+
+    Args:
+        messages: List of Anthropic messages (possibly containing system entries)
+        system: Top-level system field (str, list of blocks, or None)
+
+    Returns:
+        Tuple of (remaining_messages, merged_system) where merged_system is
+        suitable input for extract_system_prompt().
+    """
+    remaining: List[AnthropicMessage] = []
+    hoisted_blocks: List[Dict[str, Any]] = []
+
+    for msg in messages:
+        role = getattr(msg, "role", None)
+
+        if role == "system":
+            text = convert_anthropic_content_to_text(msg.content)
+            if text:
+                hoisted_blocks.append({"type": "text", "text": text})
+            continue
+
+        if role not in ("user", "assistant"):
+            # Keep the turn, but attribute it to the user rather than dropping it.
+            logger.debug(f"Coercing non-standard message role '{role}' to 'user'")
+            try:
+                msg = msg.model_copy(update={"role": "user"})
+            except Exception:  # pragma: no cover - defensive
+                msg.role = "user"
+
+        remaining.append(msg)
+
+    if not hoisted_blocks:
+        return remaining, system
+
+    # Append the original top-level system content after the hoisted blocks.
+    tail_text = extract_system_prompt(system)
+    if tail_text:
+        hoisted_blocks.append({"type": "text", "text": tail_text})
+
+    logger.debug(
+        f"Hoisted {len(hoisted_blocks)} system block(s) from messages "
+        f"({len(messages) - len(remaining)} inline system message(s) removed)"
+    )
+
+    return remaining, hoisted_blocks
+
+
+# ==================================================================================================
+# Document content blocks (issue #176)
+# ==================================================================================================
+#
+# UPSTREAM LIMITATION - READ BEFORE "FIXING" THIS.
+#
+# Anthropic clients (Claude Code) may send {"type": "document", "source": {...}} blocks, typically a
+# base64 PDF. The Kiro / CodeWhisperer `generateAssistantResponse` payload has NO document channel:
+# the only binary attachment slot is `userInputMessage.images`, which carries image formats only
+# (see kiro.converters_core.convert_images_to_kiro_format). There is therefore NO way to forward
+# PDF bytes upstream, and this gateway does NOT support native PDF reading.
+#
+# What we do instead is a truthful, observable degradation:
+#   * the block is accepted (no HTTP 422 - that was the actual bug in #176);
+#   * text-like documents (text/plain, text/markdown, text/csv, application/json, ...) are decoded
+#     and inlined verbatim, which is the obvious safe thing and genuinely works;
+#   * anything else (PDF, docx, images-as-documents, URL sources, malformed sources) is replaced by
+#     an explicit text placeholder naming the document and its media type, so the model can tell the
+#     user it cannot see the file instead of silently hallucinating its contents.
+#
+# If Kiro ever gains a document channel, replace the placeholder path - do not remove the block
+# acceptance.
+
+# Media types whose base64 payload is safe to decode and inline as text.
+_TEXTUAL_DOCUMENT_MEDIA_TYPES = frozenset(
+    {
+        "text/plain",
+        "text/markdown",
+        "text/md",
+        "text/csv",
+        "text/html",
+        "text/xml",
+        "application/json",
+        "application/xml",
+    }
+)
+
+# Cap for inlined document text so a large attachment cannot blow up the payload.
+_MAX_INLINE_DOCUMENT_CHARS = 200_000
+
+
+def _as_dict(obj: Any) -> Dict[str, Any]:
+    """Best-effort conversion of a content block / source to a plain dict."""
+    if isinstance(obj, dict):
+        return obj
+    if hasattr(obj, "model_dump"):
+        try:
+            return obj.model_dump()
+        except Exception:  # pragma: no cover - defensive
+            pass
+    return {}
+
+
+def render_document_block(block: Any) -> str:
+    """
+    Renders an Anthropic ``document`` content block as plain text.
+
+    See the module-level note above: Kiro cannot accept document bytes, so a
+    document is either inlined as text (when its media type is textual) or
+    represented by an explicit placeholder.
+
+    Args:
+        block: A ``{"type": "document", ...}`` block (dict or Pydantic model)
+
+    Returns:
+        Text to inject into the conversation. Never raises.
+    """
+    try:
+        data = _as_dict(block)
+        title = data.get("title") or "untitled document"
+        source = data.get("source")
+        source_dict = _as_dict(source)
+
+        source_type = source_dict.get("type")
+        media_type = source_dict.get("media_type") or ""
+
+        if source_type == "text":
+            text = source_dict.get("data") or source_dict.get("text") or ""
+            if text:
+                return (
+                    f"[Attached document: {title} ({media_type or 'text/plain'})]\n"
+                    f"{str(text)[:_MAX_INLINE_DOCUMENT_CHARS]}"
+                )
+
+        if source_type == "base64":
+            raw = source_dict.get("data") or ""
+            if media_type in _TEXTUAL_DOCUMENT_MEDIA_TYPES and raw:
+                try:
+                    decoded = base64.b64decode(raw, validate=False).decode(
+                        "utf-8", errors="replace"
+                    )
+                except Exception as exc:
+                    logger.warning(f"Failed to decode textual document '{title}': {exc}")
+                else:
+                    if decoded:
+                        return (
+                            f"[Attached document: {title} ({media_type})]\n"
+                            f"{decoded[:_MAX_INLINE_DOCUMENT_CHARS]}"
+                        )
+
+            size_hint = f", ~{len(raw) * 3 // 4} bytes" if raw else ""
+            return (
+                f"[Attached document: {title} (media_type={media_type or 'unknown'}{size_hint}). "
+                "This gateway cannot forward document contents to the upstream model, which accepts "
+                "text and images only. The document was NOT read. Ask the user to paste the relevant "
+                "text, or use a file-reading tool.]"
+            )
+
+        if source_type == "url":
+            url = source_dict.get("url") or ""
+            return (
+                f"[Attached document: {title} (URL: {url}). This gateway cannot fetch or forward "
+                "document contents to the upstream model. The document was NOT read.]"
+            )
+
+        # Unknown / malformed source: still degrade gracefully rather than fail.
+        return (
+            f"[Attached document: {title} with an unsupported or malformed source "
+            f"(source type={source_type or 'missing'}). The document was NOT read.]"
+        )
+    except Exception as exc:  # pragma: no cover - defensive, must never 500
+        logger.warning(f"Failed to render document content block: {exc}")
+        return "[Attached document could not be processed and was NOT read.]"
+
+
+def extract_documents_from_content(content: Any) -> List[str]:
+    """
+    Collects rendered text for every ``document`` block in a content list.
+
+    Args:
+        content: Anthropic message content (list of content blocks)
+
+    Returns:
+        List of rendered text fragments (empty if there are no document blocks).
+    """
+    rendered: List[str] = []
+
+    if not isinstance(content, list):
+        return rendered
+
+    for block in content:
+        block_type = block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+        if block_type == "document":
+            rendered.append(render_document_block(block))
+
+    if rendered:
+        logger.warning(
+            f"{len(rendered)} document block(s) degraded to text: the upstream Kiro API has no "
+            "document channel (see issue #176)"
+        )
+
+    return rendered
+
+
 def extract_tool_results_from_anthropic_content(content: Any) -> List[Dict[str, Any]]:
     """
     Extracts tool results from Anthropic message content.
@@ -147,7 +365,13 @@ def extract_tool_results_from_anthropic_content(content: Any) -> List[Dict[str, 
         if block_type == "tool_result" and tool_use_id:
             # Convert content to text if it's a list
             if isinstance(result_content, list):
+                # Documents inside a tool_result are degraded to text as well (issue #176).
+                document_texts = extract_documents_from_content(result_content)
                 result_content = extract_text_content(result_content)
+                if document_texts:
+                    result_content = "\n\n".join(
+                        part for part in [result_content, *document_texts] if part
+                    )
             elif not isinstance(result_content, str):
                 result_content = str(result_content) if result_content else ""
 
@@ -277,6 +501,7 @@ def convert_anthropic_messages(
     total_tool_calls = 0
     total_tool_results = 0
     total_images = 0
+    total_documents = 0
 
     for msg in messages:
         role = msg.role
@@ -284,6 +509,15 @@ def convert_anthropic_messages(
 
         # Extract text content
         text_content = convert_anthropic_content_to_text(content)
+
+        # Documents cannot be forwarded to Kiro; degrade them to text so the block is
+        # neither rejected (HTTP 422) nor silently dropped (issue #176).
+        document_texts = extract_documents_from_content(content)
+        if document_texts:
+            total_documents += len(document_texts)
+            text_content = "\n\n".join(
+                part for part in [text_content, *document_texts] if part
+            )
 
         # Extract tool-related data and images based on role
         tool_calls = None
@@ -327,10 +561,11 @@ def convert_anthropic_messages(
         unified_messages.append(unified_msg)
 
     # Log summary if any tool content or images were found
-    if total_tool_calls > 0 or total_tool_results > 0 or total_images > 0:
+    if total_tool_calls > 0 or total_tool_results > 0 or total_images > 0 or total_documents > 0:
         logger.debug(
             f"Converted {len(messages)} Anthropic messages: "
-            f"{total_tool_calls} tool_calls, {total_tool_results} tool_results, {total_images} images"
+            f"{total_tool_calls} tool_calls, {total_tool_results} tool_results, "
+            f"{total_images} images, {total_documents} documents"
         )
 
     return unified_messages
@@ -450,15 +685,24 @@ def anthropic_to_kiro(
     Raises:
         ValueError: If there are no messages to send
     """
+    # Hoist inline role="system" messages into the effective system prompt and
+    # coerce any remaining non-standard roles to "user" (see FIX-01).
+    normalized_messages, effective_system = normalize_inline_system_messages(
+        request.messages, request.system
+    )
+
+    if not normalized_messages:
+        raise ValueError("No messages to send after removing inline system messages")
+
     # Convert messages to unified format
-    unified_messages = convert_anthropic_messages(request.messages)
+    unified_messages = convert_anthropic_messages(normalized_messages)
 
     # Convert tools to unified format
     unified_tools = convert_anthropic_tools(request.tools)
 
     # System prompt is already separate in Anthropic format!
     # It can be a string or list of content blocks (for prompt caching)
-    system_prompt = extract_system_prompt(request.system)
+    system_prompt = extract_system_prompt(effective_system)
 
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid

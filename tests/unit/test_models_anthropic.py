@@ -1757,3 +1757,200 @@ class TestThinkingParameter:
         print(f"Comparing thinking: got={request.thinking}")
         assert request.thinking is not None
         assert request.thinking["type"] == "disabled"
+
+
+
+class TestToolResultForwardRefs:
+    """
+    FIX-04: ToolResultContentBlock.content uses string forward refs, one of which
+    (ImageContentBlock) is defined after the reference site. An explicit
+    model_rebuild() makes resolution deterministic. These tests pin the resolved
+    behaviour; they are expected to pass both before and after the change.
+    """
+
+    def test_tool_result_with_text_block(self):
+        from kiro.models_anthropic import ToolResultContentBlock, TextContentBlock
+
+        block = ToolResultContentBlock(
+            tool_use_id="toolu_1",
+            content=[{"type": "text", "text": "ok"}],
+        )
+        print(f"Comparing content: got={block.content}")
+        assert isinstance(block.content[0], TextContentBlock)
+        assert block.content[0].text == "ok"
+
+    def test_tool_result_with_image_block(self):
+        from kiro.models_anthropic import ToolResultContentBlock, ImageContentBlock
+
+        block = ToolResultContentBlock(
+            tool_use_id="toolu_2",
+            content=[
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "aGk=",
+                    },
+                }
+            ],
+        )
+        print(f"Comparing content: got={block.content}")
+        assert isinstance(block.content[0], ImageContentBlock)
+        assert block.content[0].source.media_type == "image/png"
+
+    def test_tool_result_with_tool_reference_block(self):
+        from kiro.models_anthropic import (
+            ToolResultContentBlock,
+            ToolReferenceContentBlock,
+        )
+
+        block = ToolResultContentBlock(
+            tool_use_id="toolu_3",
+            content=[{"type": "tool_reference", "tool_name": "Read"}],
+        )
+        print(f"Comparing content: got={block.content}")
+        assert isinstance(block.content[0], ToolReferenceContentBlock)
+        assert block.content[0].tool_name == "Read"
+
+    def test_tool_result_json_schema_generates(self):
+        from kiro.models_anthropic import ToolResultContentBlock
+
+        schema = ToolResultContentBlock.model_json_schema()
+        print(f"Comparing schema keys: got={sorted(schema.keys())}")
+        assert "properties" in schema
+        assert "tool_use_id" in schema["properties"]
+
+    def test_tool_result_with_string_content(self):
+        from kiro.models_anthropic import ToolResultContentBlock
+
+        block = ToolResultContentBlock(tool_use_id="toolu_4", content="plain")
+        print(f"Comparing content: got={block.content}")
+        assert block.content == "plain"
+
+
+
+# ==================================================================================================
+# Document content blocks (issue #176)
+# ==================================================================================================
+
+
+class TestDocumentContentBlock:
+    """Tests for `document` content blocks (upstream issue #176)."""
+
+    def test_base64_pdf_document_validates(self):
+        """
+        What it does: A base64 PDF document block validates as part of a message.
+        Purpose: Regression guard for the HTTP 422 reported in issue #176.
+        """
+        from kiro.models_anthropic import DocumentContentBlock, Base64DocumentSource
+
+        msg = AnthropicMessage(
+            role="user",
+            content=[
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": "JVBERi0=",
+                    },
+                    "title": "report.pdf",
+                }
+            ],
+        )
+        print(f"Comparing block type: got={type(msg.content[0]).__name__}")
+        assert isinstance(msg.content[0], DocumentContentBlock)
+        assert isinstance(msg.content[0].source, Base64DocumentSource)
+        assert msg.content[0].source.media_type == "application/pdf"
+
+    def test_url_document_validates(self):
+        from kiro.models_anthropic import DocumentContentBlock, URLDocumentSource
+
+        block = DocumentContentBlock(
+            **{"type": "document", "source": {"type": "url", "url": "https://x/y.pdf"}}
+        )
+        print(f"Comparing source type: got={type(block.source).__name__}")
+        assert isinstance(block.source, URLDocumentSource)
+        assert block.source.url == "https://x/y.pdf"
+
+    def test_plain_text_document_validates(self):
+        from kiro.models_anthropic import DocumentContentBlock, PlainTextDocumentSource
+
+        block = DocumentContentBlock(
+            **{
+                "type": "document",
+                "source": {"type": "text", "media_type": "text/plain", "data": "hello"},
+            }
+        )
+        print(f"Comparing source type: got={type(block.source).__name__}")
+        assert isinstance(block.source, PlainTextDocumentSource)
+
+    def test_malformed_source_still_validates(self):
+        """Malformed/unknown source shapes must not produce a validation error."""
+        msg = AnthropicMessage(
+            role="user",
+            content=[{"type": "document", "source": {"type": "wat", "blah": 1}}],
+        )
+        print(f"Comparing content length: got={len(msg.content)}")
+        assert len(msg.content) == 1
+
+    def test_document_in_full_request_no_422(self):
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Summarise this"},
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": "JVBERi0=",
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+        print(f"Comparing blocks: got={len(request.messages[0].content)}")
+        assert len(request.messages[0].content) == 2
+
+    def test_document_inside_tool_result_validates(self):
+        """The exact shape from issue #176: a document nested in a tool_result."""
+        from kiro.models_anthropic import DocumentContentBlock
+
+        block = ToolResultContentBlock(
+            tool_use_id="tooluse_abc",
+            content=[
+                {"type": "text", "text": "PDF file read: C:/tmp/a.pdf"},
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": "JVBERi0=",
+                    },
+                },
+            ],
+        )
+        print(f"Comparing nested types: got={[type(b).__name__ for b in block.content]}")
+        assert isinstance(block.content[1], DocumentContentBlock)
+
+    def test_image_blocks_unchanged(self):
+        """Existing image behaviour must be untouched by the document addition."""
+        msg = AnthropicMessage(
+            role="user",
+            content=[
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "abc"},
+                }
+            ],
+        )
+        print(f"Comparing block type: got={type(msg.content[0]).__name__}")
+        assert isinstance(msg.content[0], ImageContentBlock)
+        assert isinstance(msg.content[0].source, Base64ImageSource)

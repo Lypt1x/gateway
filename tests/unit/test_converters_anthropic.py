@@ -1884,3 +1884,235 @@ class TestAnthropicToKiroIntegration:
         print(f"Checking for <max_thinking_length>6000</max_thinking_length>...")
         assert "<max_thinking_length>6000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+
+# ==================================================================================================
+# Document block conversion (issue #176)
+# ==================================================================================================
+
+import base64 as _base64
+
+from kiro.converters_anthropic import (
+    extract_documents_from_content,
+    render_document_block,
+)
+
+
+class TestDocumentBlockConversion:
+    """
+    Tests for the graceful degradation of Anthropic `document` blocks.
+
+    Kiro/CodeWhisperer has no document channel, so documents become text.
+    """
+
+    def test_pdf_becomes_explicit_placeholder(self):
+        print("Setup: base64 PDF document block...")
+        text = render_document_block(
+            {
+                "type": "document",
+                "title": "report.pdf",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": "JVBERi0=",
+                },
+            }
+        )
+        print(f"Comparing rendered text: got={text[:80]!r}")
+        assert "report.pdf" in text
+        assert "application/pdf" in text
+        assert "NOT read" in text
+
+    def test_textual_document_is_inlined(self):
+        payload = _base64.b64encode(b"hello from the file").decode()
+        text = render_document_block(
+            {
+                "type": "document",
+                "title": "notes.txt",
+                "source": {"type": "base64", "media_type": "text/plain", "data": payload},
+            }
+        )
+        print(f"Comparing rendered text: got={text!r}")
+        assert "hello from the file" in text
+
+    def test_plain_text_source_is_inlined(self):
+        text = render_document_block(
+            {
+                "type": "document",
+                "source": {"type": "text", "media_type": "text/plain", "data": "inline body"},
+            }
+        )
+        print(f"Comparing rendered text: got={text!r}")
+        assert "inline body" in text
+
+    def test_url_source_placeholder(self):
+        text = render_document_block(
+            {"type": "document", "source": {"type": "url", "url": "https://x/y.pdf"}}
+        )
+        print(f"Comparing rendered text: got={text!r}")
+        assert "https://x/y.pdf" in text
+        assert "NOT read" in text
+
+    def test_malformed_source_does_not_raise(self):
+        for bad in [
+            {"type": "document"},
+            {"type": "document", "source": None},
+            {"type": "document", "source": "nonsense"},
+            {"type": "document", "source": {"type": "mystery"}},
+        ]:
+            text = render_document_block(bad)
+            print(f"Comparing rendered text for {bad}: got={text[:60]!r}")
+            assert isinstance(text, str) and text
+
+    def test_extract_documents_ignores_other_blocks(self):
+        docs = extract_documents_from_content(
+            [
+                {"type": "text", "text": "hi"},
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "a"},
+                },
+                {
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": "application/pdf", "data": "a"},
+                },
+            ]
+        )
+        print(f"Comparing document count: got={len(docs)}")
+        assert len(docs) == 1
+
+    def test_extract_documents_non_list(self):
+        print("Comparing non-list input...")
+        assert extract_documents_from_content("just a string") == []
+
+    def test_document_alongside_text_preserves_text(self):
+        print("Setup: message with text + document...")
+        messages = [
+            AnthropicMessage(
+                role="user",
+                content=[
+                    {"type": "text", "text": "Summarise the attachment"},
+                    {
+                        "type": "document",
+                        "title": "a.pdf",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": "JVBERi0=",
+                        },
+                    },
+                ],
+            )
+        ]
+        unified = convert_anthropic_messages(messages)
+        print(f"Comparing unified content: got={unified[0].content[:90]!r}")
+        assert "Summarise the attachment" in unified[0].content
+        assert "a.pdf" in unified[0].content
+
+    def test_document_in_tool_result_becomes_text(self):
+        messages = [
+            AnthropicMessage(
+                role="user",
+                content=[
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tooluse_1",
+                        "content": [
+                            {"type": "text", "text": "PDF file read: /tmp/a.pdf"},
+                            {
+                                "type": "document",
+                                "title": "a.pdf",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "application/pdf",
+                                    "data": "JVBERi0=",
+                                },
+                            },
+                        ],
+                    }
+                ],
+            )
+        ]
+        unified = convert_anthropic_messages(messages)
+        result_text = unified[0].tool_results[0]["content"]
+        print(f"Comparing tool_result content: got={result_text[:90]!r}")
+        assert "PDF file read: /tmp/a.pdf" in result_text
+        assert "a.pdf" in result_text
+
+    def test_full_conversion_with_document_does_not_raise(self):
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Read this"},
+                        {
+                            "type": "document",
+                            "title": "a.pdf",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": "JVBERi0=",
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro", return_value="claude-sonnet-4-5"
+        ):
+            payload = anthropic_to_kiro(request, "conv-176", "arn:aws:test")
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        print(f"Comparing payload content: got={content[:120]!r}")
+        assert "Read this" in content
+        assert "a.pdf" in content
+
+    def test_url_document_full_conversion(self):
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "document", "source": {"type": "url", "url": "https://x/y.pdf"}}
+                    ],
+                }
+            ],
+        )
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro", return_value="claude-sonnet-4-5"
+        ):
+            payload = anthropic_to_kiro(request, "conv-176b", "arn:aws:test")
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        print(f"Comparing payload content: got={content[:120]!r}")
+        assert "https://x/y.pdf" in content
+
+    def test_images_still_extracted_alongside_documents(self):
+        """Existing image behaviour must be unchanged."""
+        messages = [
+            AnthropicMessage(
+                role="user",
+                content=[
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": "abc123"},
+                    },
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": "JVBERi0=",
+                        },
+                    },
+                ],
+            )
+        ]
+        unified = convert_anthropic_messages(messages)
+        print(f"Comparing images: got={unified[0].images}")
+        assert unified[0].images == [{"media_type": "image/png", "data": "abc123"}]
