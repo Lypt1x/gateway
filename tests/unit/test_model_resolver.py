@@ -618,6 +618,49 @@ class TestGetModelIdForKiro:
         print(f"Comparing result: Expected 'CLAUDE_3_7_SONNET_20250219_V1_0' (pass-through), Got '{result}'")
         assert result == "CLAUDE_3_7_SONNET_20250219_V1_0"
 
+    def test_default_alias_auto_kiro_resolves(self):
+        """
+        What it does: Default config alias 'auto-kiro' resolves to 'auto'.
+        Goal: FIX-06 — request path agrees with listing path.
+        """
+        assert get_model_id_for_kiro("auto-kiro", {}) == "auto"
+
+    def test_custom_alias_from_config_resolves(self):
+        """
+        What it does: Injected alias map is applied.
+        Goal: FIX-06 — user-defined aliases resolve on the request path.
+        """
+        aliases = {"my-opus": "claude-opus-4.5"}
+        result = get_model_id_for_kiro("my-opus", {}, aliases=aliases)
+        assert result == "claude-opus-4.5"
+
+    def test_non_alias_passes_through_unchanged(self):
+        """
+        What it does: A model absent from the alias map is untouched.
+        Goal: FIX-06 — preserve 'gateway, not gatekeeper'.
+        """
+        aliases = {"my-opus": "claude-opus-4.5"}
+        assert get_model_id_for_kiro("some-future-model", {}, aliases=aliases) == "some-future-model"
+
+    def test_alias_to_hidden_model_maps_through_hidden(self):
+        """
+        What it does: Alias target is then resolved via hidden_models.
+        Goal: FIX-06 — order normalize → aliases → hidden_models.
+        """
+        hidden = {"claude-3.7-sonnet": "CLAUDE_3_7_SONNET_20250219_V1_0"}
+        aliases = {"legacy": "claude-3-7-sonnet"}
+        result = get_model_id_for_kiro("legacy", hidden, aliases=aliases)
+        assert result == "CLAUDE_3_7_SONNET_20250219_V1_0"
+
+    def test_self_referential_alias_does_not_loop(self):
+        """
+        What it does: Self-referential and cyclic alias config terminates.
+        Goal: FIX-06 — single-hop resolution only.
+        """
+        assert get_model_id_for_kiro("loop", {}, aliases={"loop": "loop"}) == "loop"
+        cyclic = {"a": "b", "b": "a"}
+        assert get_model_id_for_kiro("a", {}, aliases=cyclic) == "b"
+
     def test_passthrough_unknown_model(self):
         """
         What it does: Unknown models pass through as-is (gateway, not gatekeeper).
