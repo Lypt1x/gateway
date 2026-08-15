@@ -41,12 +41,32 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
 from kiro.tokenizer import count_message_tokens, count_tokens
+from kiro.utils import get_kiro_headers
+from kiro.config import PROFILE_ARN
 
 # Import debug_logger
 try:
     from kiro.debug_logger import debug_logger
 except ImportError:
     debug_logger = None
+
+
+# ==================================================================================================
+# Continuation / Synthesis Configuration (issue #258)
+# ==================================================================================================
+
+# Hard cap on how many times a single client request may re-enter the model after an
+# emulated web search. Deliberately a module constant (not config/env) so the public
+# contract does not change and no new required configuration is introduced.
+#
+# LOOP SAFETY: the continuation request built by stream_web_search_synthesis() carries
+# NO tools at all, so the model physically cannot request another web_search from it.
+# That alone makes the recursion depth 1. The explicit round counter below is a second,
+# independent stop condition in case a caller ever chains continuations manually.
+MAX_WEB_SEARCH_CONTINUATION_ROUNDS = 1
+
+# Max tokens requested for the synthesis turn.
+WEB_SEARCH_SYNTHESIS_MAX_TOKENS = 4096
 
 
 # ==================================================================================================
@@ -135,6 +155,19 @@ async def call_kiro_mcp_api(
             "arguments": {"query": query}
         }
     }
+
+    # profileArn must sit at the JSON-RPC BODY ROOT (sibling of id/jsonrpc/method/params).
+    # Inside "params" the endpoint still answers 400 "profileArn is required for this request."
+    # Never send an empty string: omit the key entirely when no ARN is available.
+    profile_arn = getattr(auth_manager, "profile_arn", None) or PROFILE_ARN
+    if profile_arn:
+        mcp_request["profileArn"] = profile_arn
+    else:
+        logger.warning(
+            "MCP web_search: no profileArn available (auth_manager.profile_arn and "
+            "PROFILE_ARN are both empty). The MCP endpoint usually rejects such "
+            "requests with HTTP 400 'profileArn is required for this request.'"
+        )
     
     # Log MCP request
     try:
@@ -147,12 +180,17 @@ async def call_kiro_mcp_api(
     try:
         token = await auth_manager.get_access_token()
         
-        # EXACT headers from architecture
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "x-amzn-codewhisperer-optout": "false",
-            "Content-Type": "application/json"
-        }
+        # Kiro client-identity headers are as mandatory as profileArn here: with the ARN
+        # but minimal headers the endpoint answers 403 "User is not authorized to make
+        # this call." The Kiro User-Agent is the gate. Reuse the shared builder instead
+        # of hardcoding it so the identity stays in one place.
+        headers = get_kiro_headers(auth_manager, token)
+        # /mcp is plain JSON-RPC, not the streaming RPC endpoint:
+        headers["Content-Type"] = "application/json"
+        # x-amz-target names GenerateAssistantResponse and does not apply to /mcp.
+        headers.pop("x-amz-target", None)
+        # Preserve the opt-out value the MCP path has always sent.
+        headers["x-amzn-codewhisperer-optout"] = "false"
         
         mcp_url = f"{auth_manager.q_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")
@@ -161,7 +199,16 @@ async def call_kiro_mcp_api(
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
             
             if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
+                # Include the body: it names the actual cause (e.g. "profileArn is
+                # required for this request."). Never log tokens or headers.
+                body_preview = ""
+                try:
+                    body_preview = (response.text or "")[:500]
+                except Exception:
+                    body_preview = "<unreadable body>"
+                logger.error(
+                    f"MCP API error: {response.status_code} body={body_preview}"
+                )
                 return None, None
             
             mcp_response = response.json()
@@ -275,6 +322,181 @@ def generate_search_summary(query: str, results: Dict) -> str:
 
 
 # ==================================================================================================
+# Continuation: feed search results back to the model for synthesis (issue #258)
+# ==================================================================================================
+
+def has_search_results(results: Optional[Dict]) -> bool:
+    """
+    Return True if the MCP response contains at least one usable result.
+
+    Used as a precondition for the synthesis continuation: an empty or failed
+    search must degrade to the plain summary rather than burn an upstream call.
+    """
+    if not results:
+        return False
+    items = results.get("results")
+    return bool(items)
+
+
+def build_synthesis_prompt(query: str, results: Dict) -> str:
+    """
+    Build the continuation prompt that carries the search results back to the model.
+
+    The results are provided as an observation, and the model is asked to answer the
+    original question from them. No tools are attached to the continuation request,
+    so the model cannot start another search round from here.
+
+    Args:
+        query: Original search query
+        results: Parsed MCP response
+
+    Returns:
+        Prompt text for a single user-role message
+    """
+    summary = generate_search_summary(query, results)
+    return (
+        "The following web search results were retrieved for the query "
+        f'"{query}".\n'
+        f"{summary}\n"
+        "Using these results, write the answer to the original request. "
+        "Cite the relevant sources by URL. Do not perform another search; "
+        "if the results are insufficient, say so explicitly."
+    )
+
+
+async def stream_web_search_synthesis(
+    model: str,
+    query: str,
+    results: Optional[Dict],
+    auth_manager,
+    round_index: int = 0,
+    max_rounds: int = MAX_WEB_SEARCH_CONTINUATION_ROUNDS,
+):
+    """
+    Stream the model's synthesised answer built from emulated web search results.
+
+    This closes issue #258: previously the emulated web search emitted a formatted
+    result dump and ended the turn, so the model never saw its own search output.
+
+    The function is intentionally best-effort: any failure (missing dependency,
+    non-200 upstream, parse error, timeout) yields nothing and returns, leaving the
+    caller with the pre-existing summary-only behaviour. It never raises to the
+    caller except for GeneratorExit (client disconnect), which is propagated.
+
+    Loop safety (three independent guards):
+      1. ``round_index >= max_rounds`` returns immediately.
+      2. The continuation payload declares no tools, so no further web_search can
+         be requested from within it.
+      3. Empty/failed searches return before any upstream call is made.
+
+    Args:
+        model: Model name to use for the continuation
+        query: Original search query
+        results: Parsed MCP results dict (may be None)
+        auth_manager: KiroAuthManager instance (may be None)
+        round_index: Zero-based continuation round already consumed
+        max_rounds: Hard cap on continuation rounds
+
+    Yields:
+        Text fragments of the synthesised answer.
+    """
+    # Guard 1: continuation budget exhausted
+    if round_index >= max_rounds:
+        logger.debug(
+            f"WebSearch synthesis skipped: continuation cap reached "
+            f"(round_index={round_index}, max_rounds={max_rounds})"
+        )
+        return
+
+    # Guard 3: nothing to synthesise from
+    if auth_manager is None or not has_search_results(results):
+        logger.debug("WebSearch synthesis skipped: no auth_manager or no results")
+        return
+
+    try:
+        from kiro.models_anthropic import AnthropicMessagesRequest
+        from kiro.converters_anthropic import anthropic_to_kiro
+        from kiro.http_client import KiroHttpClient
+        from kiro.streaming_core import parse_kiro_stream
+        from kiro.utils import generate_conversation_id
+    except Exception as e:  # pragma: no cover - import guard
+        logger.warning(f"WebSearch synthesis unavailable (import failed): {e}")
+        return
+
+    http_client = None
+    try:
+        # Guard 2: no tools on the continuation request -> no further search rounds
+        continuation_request = AnthropicMessagesRequest(
+            model=model,
+            max_tokens=WEB_SEARCH_SYNTHESIS_MAX_TOKENS,
+            stream=True,
+            messages=[{
+                "role": "user",
+                "content": build_synthesis_prompt(query, results)
+            }]
+        )
+
+        payload = anthropic_to_kiro(
+            continuation_request,
+            generate_conversation_id(),
+            getattr(auth_manager, "profile_arn", "") or ""
+        )
+
+        url = f"{auth_manager.api_host}/generateAssistantResponse"
+        logger.info(f"WebSearch synthesis: continuing turn via {url}")
+
+        http_client = KiroHttpClient(auth_manager, shared_client=None)
+        response = await http_client.request_with_retry("POST", url, payload, stream=True)
+
+        if getattr(response, "status_code", None) != 200:
+            logger.error(
+                f"WebSearch synthesis failed: upstream status "
+                f"{getattr(response, 'status_code', 'unknown')}"
+            )
+            return
+
+        async for event in parse_kiro_stream(response):
+            if getattr(event, "type", None) == "content":
+                content = getattr(event, "content", None)
+                if content:
+                    yield content
+
+    except GeneratorExit:
+        # Client disconnected - propagate so the outer generator can unwind
+        raise
+    except Exception as e:
+        logger.error(f"WebSearch synthesis error, degrading to summary only: {e}")
+    finally:
+        if http_client is not None:
+            try:
+                await http_client.close()
+            except Exception as e:
+                logger.warning(f"WebSearch synthesis: error closing HTTP client: {e}")
+
+
+async def collect_web_search_synthesis(
+    model: str,
+    query: str,
+    results: Optional[Dict],
+    auth_manager,
+    round_index: int = 0,
+    max_rounds: int = MAX_WEB_SEARCH_CONTINUATION_ROUNDS,
+) -> str:
+    """
+    Non-streaming counterpart of stream_web_search_synthesis().
+
+    Returns the full synthesised answer, or "" when synthesis is skipped or fails.
+    """
+    parts = []
+    async for chunk in stream_web_search_synthesis(
+        model, query, results, auth_manager,
+        round_index=round_index, max_rounds=max_rounds
+    ):
+        parts.append(chunk)
+    return "".join(parts)
+
+
+# ==================================================================================================
 # SSE Emulation (Anthropic Format)
 # ==================================================================================================
 
@@ -283,7 +505,8 @@ async def generate_anthropic_web_search_sse(
     query: str,
     tool_use_id: str,
     results: Dict,
-    input_tokens: int
+    input_tokens: int,
+    synthesis_stream=None
 ):
     """
     Generate Anthropic SSE stream for web_search response.
@@ -411,6 +634,42 @@ async def generate_anthropic_web_search_sse(
         "index": 2
     })
     
+    # ==============================================================================
+    # Continuation (issue #258): stream the model's synthesised answer
+    # ==============================================================================
+    # A separate text block (index 3) is opened lazily, only if the synthesis
+    # actually produces content. If synthesis is unavailable or fails, the stream
+    # ends exactly as before - no empty block, no error surfaced to the client.
+    if synthesis_stream is not None:
+        synthesis_started = False
+        try:
+            async for text in synthesis_stream:
+                if not text:
+                    continue
+                if not synthesis_started:
+                    yield format_sse_event("content_block_start", {
+                        "type": "content_block_start",
+                        "index": 3,
+                        "content_block": {"type": "text", "text": ""}
+                    })
+                    synthesis_started = True
+                output_tokens += count_tokens(text, apply_claude_correction=False)
+                yield format_sse_event("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": 3,
+                    "delta": {"type": "text_delta", "text": text}
+                })
+        except GeneratorExit:
+            raise
+        except Exception as e:
+            logger.error(f"WebSearch synthesis stream error: {e}")
+        
+        if synthesis_started:
+            yield format_sse_event("content_block_stop", {
+                "type": "content_block_stop",
+                "index": 3
+            })
+    
     # Event N+2: message_delta
     yield format_sse_event("message_delta", {
         "type": "message_delta",
@@ -433,7 +692,8 @@ async def generate_openai_web_search_sse(
     query: str,
     tool_use_id: str,
     results: Dict,
-    input_tokens: int
+    input_tokens: int,
+    synthesis_stream=None
 ):
     """
     Generate OpenAI SSE stream for web_search response.
@@ -503,6 +763,32 @@ async def generate_openai_web_search_sse(
             }]
         }
         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+    
+    # ==============================================================================
+    # Continuation (issue #258): stream the model's synthesised answer as content
+    # ==============================================================================
+    if synthesis_stream is not None:
+        try:
+            async for text in synthesis_stream:
+                if not text:
+                    continue
+                output_tokens += count_tokens(text, apply_claude_correction=False)
+                chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": text},
+                        "finish_reason": None
+                    }]
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        except GeneratorExit:
+            raise
+        except Exception as e:
+            logger.error(f"WebSearch synthesis stream error: {e}")
     
     # Chunk N+1: finish_reason + usage
     chunk = {
@@ -650,13 +936,24 @@ async def handle_native_web_search(
         # Streaming mode - generate SSE
         logger.debug(f"Returning streaming web_search response (api_format={api_format})")
         
+        # Issue #258: feed the results back to the model so it synthesises an answer
+        # instead of the turn ending at the raw summary. Bounded to
+        # MAX_WEB_SEARCH_CONTINUATION_ROUNDS and degrades to summary-only on failure.
+        synthesis_stream = stream_web_search_synthesis(
+            request_data.model,
+            query,
+            results,
+            auth_manager
+        )
+        
         if api_format == "openai":
             sse_generator = generate_openai_web_search_sse(
                 request_data.model,
                 query,
                 tool_use_id,
                 results,
-                input_tokens
+                input_tokens,
+                synthesis_stream=synthesis_stream
             )
         else:  # anthropic
             sse_generator = generate_anthropic_web_search_sse(
@@ -664,7 +961,8 @@ async def handle_native_web_search(
                 query,
                 tool_use_id,
                 results,
-                input_tokens
+                input_tokens,
+                synthesis_stream=synthesis_stream
             )
         
         return StreamingResponse(
@@ -677,8 +975,18 @@ async def handle_native_web_search(
         logger.debug(f"Returning non-streaming web_search response (api_format={api_format})")
         summary = generate_search_summary(query, results)
         
+        # Issue #258: synthesise an answer from the results (bounded, best-effort)
+        synthesis_text = await collect_web_search_synthesis(
+            request_data.model,
+            query,
+            results,
+            auth_manager
+        )
+        
         # Count output tokens WITHOUT Claude correction (MCP API response)
         output_tokens = count_tokens(summary, apply_claude_correction=False)
+        if synthesis_text:
+            output_tokens += count_tokens(synthesis_text, apply_claude_correction=False)
         
         if api_format == "openai":
             # OpenAI format: chat.completion
@@ -695,7 +1003,7 @@ async def handle_native_web_search(
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": summary
+                        "content": summary + (f"\n{synthesis_text}" if synthesis_text else "")
                     },
                     "finish_reason": "stop"
                 }],
@@ -749,5 +1057,9 @@ async def handle_native_web_search(
                     "output_tokens": output_tokens
                 }
             }
+        
+        if synthesis_text and api_format != "openai":
+            # Issue #258: model's synthesised answer as an additional text block
+            full_response["content"].append({"type": "text", "text": synthesis_text})
         
         return JSONResponse(content=full_response)

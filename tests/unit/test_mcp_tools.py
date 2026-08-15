@@ -600,3 +600,521 @@ class TestOpenAISSEEmulation:
         
         print("Checking for usage information...")
         assert any('"usage"' in chunk for chunk in chunks)
+
+
+
+# ==================================================================================================
+# Tests for WebSearch Continuation / Synthesis (issue #258)
+# ==================================================================================================
+
+from kiro.mcp_tools import (
+    MAX_WEB_SEARCH_CONTINUATION_ROUNDS,
+    has_search_results,
+    build_synthesis_prompt,
+    stream_web_search_synthesis,
+    collect_web_search_synthesis,
+)
+
+
+SAMPLE_RESULTS = {
+    "results": [{
+        "title": "Python 3.13 release notes",
+        "url": "https://python.org/3.13",
+        "snippet": "Python 3.13 introduces a new REPL.",
+    }],
+    "totalResults": 1,
+}
+
+
+class _FakeEvent:
+    """Minimal stand-in for KiroEvent."""
+
+    def __init__(self, type_, content=None):
+        self.type = type_
+        self.content = content
+
+
+def _make_auth_manager():
+    auth_manager = Mock()
+    auth_manager.api_host = "https://kiro.example"
+    auth_manager.profile_arn = "arn:aws:test"
+    auth_manager.get_access_token = AsyncMock(return_value="token")
+    return auth_manager
+
+
+def _patch_upstream(events, status_code=200, request_error=None, captured=None):
+    """
+    Patch KiroHttpClient + parse_kiro_stream so the continuation call is fully offline.
+
+    Returns a context manager tuple to be used with `with`.
+    """
+    response = Mock()
+    response.status_code = status_code
+
+    async def fake_request(method, url, json_data=None, params=None, stream=False):
+        if captured is not None:
+            captured["method"] = method
+            captured["url"] = url
+            captured["payload"] = json_data
+            captured["stream"] = stream
+        if request_error is not None:
+            raise request_error
+        return response
+
+    fake_client = Mock()
+    fake_client.request_with_retry = fake_request
+    fake_client.close = AsyncMock()
+
+    async def fake_parse(resp, *args, **kwargs):
+        for ev in events:
+            yield ev
+
+    client_patch = patch("kiro.http_client.KiroHttpClient", return_value=fake_client)
+    parse_patch = patch("kiro.streaming_core.parse_kiro_stream", fake_parse)
+    return client_patch, parse_patch, fake_client
+
+
+class TestSynthesisHelpers:
+    """Tests for the small pure helpers backing the continuation."""
+
+    def test_has_search_results_true(self):
+        print("Action: Checking non-empty results...")
+        assert has_search_results(SAMPLE_RESULTS) is True
+
+    def test_has_search_results_false_cases(self):
+        print("Action: Checking None / empty / missing key...")
+        assert has_search_results(None) is False
+        assert has_search_results({}) is False
+        assert has_search_results({"results": []}) is False
+        assert has_search_results({"totalResults": 0}) is False
+
+    def test_build_synthesis_prompt_carries_results(self):
+        """
+        What it does: Verifies the continuation prompt contains the search results.
+        Purpose: This is the actual feedback channel fixing issue #258.
+        """
+        print("Action: Building synthesis prompt...")
+        prompt = build_synthesis_prompt("python 3.13", SAMPLE_RESULTS)
+
+        print("Checking query, URL and snippet are present...")
+        assert "python 3.13" in prompt
+        assert "https://python.org/3.13" in prompt
+        assert "Python 3.13 introduces a new REPL." in prompt
+
+        print("Checking the model is instructed to answer, not search again...")
+        assert "Do not perform another search" in prompt
+
+    def test_continuation_cap_default_is_bounded(self):
+        print("Action: Checking the cap constant...")
+        assert isinstance(MAX_WEB_SEARCH_CONTINUATION_ROUNDS, int)
+        assert 1 <= MAX_WEB_SEARCH_CONTINUATION_ROUNDS <= 3
+
+
+class TestStreamWebSearchSynthesis:
+    """Tests for the continuation call itself. No live API calls are made."""
+
+    @pytest.mark.asyncio
+    async def test_results_are_fed_back_and_synthesis_occurs(self):
+        """
+        What it does: Runs the continuation and collects the model's answer.
+        Purpose: Core issue #258 fix - the turn no longer ends at the summary.
+        """
+        print("Setup: Patching upstream with a two-chunk content stream...")
+        captured = {}
+        events = [
+            _FakeEvent("content", "Python 3.13 "),
+            _FakeEvent("usage", None),
+            _FakeEvent("content", "adds a new REPL."),
+        ]
+        client_patch, parse_patch, fake_client = _patch_upstream(events, captured=captured)
+
+        print("Action: Streaming synthesis...")
+        with client_patch, parse_patch:
+            chunks = [
+                c async for c in stream_web_search_synthesis(
+                    "claude-sonnet-4", "python 3.13", SAMPLE_RESULTS, _make_auth_manager()
+                )
+            ]
+
+        print(f"Comparing output: Got {chunks}")
+        assert "".join(chunks) == "Python 3.13 adds a new REPL."
+
+        print("Checking the upstream call carried the search results...")
+        payload_json = json.dumps(captured["payload"])
+        assert "https://python.org/3.13" in payload_json
+        assert captured["url"].endswith("/generateAssistantResponse")
+        assert captured["stream"] is True
+
+        print("Checking the HTTP client was closed...")
+        fake_client.close.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_continuation_payload_declares_no_tools(self):
+        """
+        What it does: Verifies the continuation request carries no tools.
+        Purpose: Structural loop guard - the model cannot request another web_search.
+        """
+        print("Setup: Patching upstream...")
+        captured = {}
+        client_patch, parse_patch, _ = _patch_upstream(
+            [_FakeEvent("content", "ok")], captured=captured
+        )
+
+        print("Action: Streaming synthesis...")
+        with client_patch, parse_patch:
+            async for _ in stream_web_search_synthesis(
+                "claude-sonnet-4", "python", SAMPLE_RESULTS, _make_auth_manager()
+            ):
+                pass
+
+        print("Checking no tool specification is present in the payload...")
+        payload_json = json.dumps(captured["payload"])
+        assert "toolSpecification" not in payload_json
+
+    @pytest.mark.asyncio
+    async def test_continuation_cap_is_enforced(self):
+        """
+        What it does: Calls with an exhausted round budget.
+        Purpose: Ensure no unbounded continuation loop - no upstream call at all.
+        """
+        print("Setup: Patching upstream (must not be used)...")
+        captured = {}
+        client_patch, parse_patch, _ = _patch_upstream(
+            [_FakeEvent("content", "should not appear")], captured=captured
+        )
+
+        print("Action: Streaming with round_index == max_rounds...")
+        with client_patch, parse_patch:
+            chunks = [
+                c async for c in stream_web_search_synthesis(
+                    "claude-sonnet-4", "python", SAMPLE_RESULTS, _make_auth_manager(),
+                    round_index=1, max_rounds=1
+                )
+            ]
+
+        print(f"Comparing output: Expected [], Got {chunks}")
+        assert chunks == []
+
+        print("Checking no upstream request was made...")
+        assert captured == {}
+
+    @pytest.mark.asyncio
+    async def test_continuation_cap_enforced_at_default(self):
+        """
+        What it does: Verifies the default cap blocks a second round.
+        Purpose: The default configuration is bounded without any caller effort.
+        """
+        print("Action: Streaming with round_index == default cap...")
+        chunks = [
+            c async for c in stream_web_search_synthesis(
+                "claude-sonnet-4", "python", SAMPLE_RESULTS, _make_auth_manager(),
+                round_index=MAX_WEB_SEARCH_CONTINUATION_ROUNDS
+            )
+        ]
+        print(f"Comparing output: Expected [], Got {chunks}")
+        assert chunks == []
+
+    @pytest.mark.asyncio
+    async def test_empty_results_degrade_gracefully(self):
+        """
+        What it does: Runs synthesis with empty / failed search results.
+        Purpose: Must return immediately, no hang, no exception, no upstream call.
+        """
+        print("Action: Streaming with empty and None results...")
+        for bad in (None, {}, {"results": []}):
+            chunks = [
+                c async for c in stream_web_search_synthesis(
+                    "claude-sonnet-4", "python", bad, _make_auth_manager()
+                )
+            ]
+            print(f"Comparing output for {bad!r}: Expected [], Got {chunks}")
+            assert chunks == []
+
+    @pytest.mark.asyncio
+    async def test_missing_auth_manager_degrades_gracefully(self):
+        print("Action: Streaming without an auth manager...")
+        chunks = [
+            c async for c in stream_web_search_synthesis(
+                "claude-sonnet-4", "python", SAMPLE_RESULTS, None
+            )
+        ]
+        print(f"Comparing output: Expected [], Got {chunks}")
+        assert chunks == []
+
+    @pytest.mark.asyncio
+    async def test_upstream_non_200_degrades_gracefully(self):
+        """
+        What it does: Upstream returns 500 for the continuation.
+        Purpose: Must yield nothing (client still gets the summary), never raise.
+        """
+        print("Setup: Patching upstream with status 500...")
+        client_patch, parse_patch, fake_client = _patch_upstream(
+            [_FakeEvent("content", "unused")], status_code=500
+        )
+
+        print("Action: Streaming synthesis...")
+        with client_patch, parse_patch:
+            chunks = [
+                c async for c in stream_web_search_synthesis(
+                    "claude-sonnet-4", "python", SAMPLE_RESULTS, _make_auth_manager()
+                )
+            ]
+
+        print(f"Comparing output: Expected [], Got {chunks}")
+        assert chunks == []
+        fake_client.close.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_upstream_exception_degrades_gracefully(self):
+        """
+        What it does: Upstream raises during the continuation request.
+        Purpose: Failure must be swallowed so the client never sees a 500.
+        """
+        print("Setup: Patching upstream to raise...")
+        client_patch, parse_patch, fake_client = _patch_upstream(
+            [], request_error=RuntimeError("boom")
+        )
+
+        print("Action: Streaming synthesis...")
+        with client_patch, parse_patch:
+            chunks = [
+                c async for c in stream_web_search_synthesis(
+                    "claude-sonnet-4", "python", SAMPLE_RESULTS, _make_auth_manager()
+                )
+            ]
+
+        print(f"Comparing output: Expected [], Got {chunks}")
+        assert chunks == []
+        fake_client.close.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_collect_web_search_synthesis_joins_chunks(self):
+        print("Setup: Patching upstream with two content events...")
+        client_patch, parse_patch, _ = _patch_upstream([
+            _FakeEvent("content", "A"),
+            _FakeEvent("content", "B"),
+        ])
+
+        print("Action: Collecting synthesis...")
+        with client_patch, parse_patch:
+            text = await collect_web_search_synthesis(
+                "claude-sonnet-4", "python", SAMPLE_RESULTS, _make_auth_manager()
+            )
+
+        print(f"Comparing text: Expected 'AB', Got '{text}'")
+        assert text == "AB"
+
+    @pytest.mark.asyncio
+    async def test_collect_returns_empty_string_on_failure(self):
+        print("Action: Collecting with no results...")
+        text = await collect_web_search_synthesis(
+            "claude-sonnet-4", "python", None, _make_auth_manager()
+        )
+        print(f"Comparing text: Expected '', Got '{text}'")
+        assert text == ""
+
+
+class TestSSEWithSynthesis:
+    """Tests that the synthesised answer reaches the client stream."""
+
+    @staticmethod
+    async def _text_stream(*parts):
+        for p in parts:
+            yield p
+
+    @pytest.mark.asyncio
+    async def test_anthropic_sse_streams_synthesis_block(self):
+        """
+        What it does: Passes a synthesis stream to the Anthropic SSE emitter.
+        Purpose: The client must receive the model's answer after the summary.
+        """
+        print("Setup: Preparing synthesis stream...")
+        stream = self._text_stream("The answer ", "is 42.")
+
+        print("Action: Generating SSE...")
+        events = []
+        async for ev in generate_anthropic_web_search_sse(
+            "claude-sonnet-4", "python", "srvtoolu_x", SAMPLE_RESULTS, 100,
+            synthesis_stream=stream
+        ):
+            events.append(ev)
+
+        joined = "".join(events)
+        print("Checking synthesis text is present...")
+        assert "The answer " in joined
+        assert "is 42." in joined
+
+        print("Checking a dedicated text block (index 3) was opened and closed...")
+        assert '"index": 3' in joined
+        assert joined.count('"index": 3') >= 3  # start + 2 deltas + stop
+
+        print("Checking message_stop still terminates the stream...")
+        assert "message_stop" in events[-1]
+
+    @pytest.mark.asyncio
+    async def test_anthropic_sse_no_empty_block_when_synthesis_empty(self):
+        """
+        What it does: Synthesis yields nothing (failed search continuation).
+        Purpose: Stream must be byte-identical to the pre-fix behaviour.
+        """
+        print("Setup: Empty synthesis stream...")
+        empty = self._text_stream()
+
+        print("Action: Generating SSE with and without synthesis...")
+        with_synth = [
+            e async for e in generate_anthropic_web_search_sse(
+                "claude-sonnet-4", "python", "srvtoolu_x", SAMPLE_RESULTS, 100,
+                synthesis_stream=empty
+            )
+        ]
+        without = [
+            e async for e in generate_anthropic_web_search_sse(
+                "claude-sonnet-4", "python", "srvtoolu_x", SAMPLE_RESULTS, 100
+            )
+        ]
+
+        print("Checking no index-3 block was emitted...")
+        assert '"index": 3' not in "".join(with_synth)
+
+        print("Comparing event counts (message_id differs, count must not)...")
+        assert len(with_synth) == len(without)
+
+    @pytest.mark.asyncio
+    async def test_openai_sse_streams_synthesis_content(self):
+        """
+        What it does: Passes a synthesis stream to the OpenAI SSE emitter.
+        Purpose: OpenAI clients also get the synthesised answer.
+        """
+        print("Setup: Preparing synthesis stream...")
+        stream = self._text_stream("Synthesised answer.")
+
+        print("Action: Generating SSE...")
+        chunks = []
+        async for c in generate_openai_web_search_sse(
+            "claude-sonnet-4", "python", "srvtoolu_x", SAMPLE_RESULTS, 100,
+            synthesis_stream=stream
+        ):
+            chunks.append(c)
+
+        joined = "".join(chunks)
+        print("Checking synthesis content and terminator...")
+        assert "Synthesised answer." in joined
+        assert chunks[-1].strip() == "data: [DONE]"
+        assert '"finish_reason": "stop"' in joined or '"finish_reason":"stop"' in joined
+
+    @pytest.mark.asyncio
+    async def test_sse_survives_failing_synthesis_stream(self):
+        """
+        What it does: Synthesis stream raises mid-iteration.
+        Purpose: The client stream must still terminate cleanly (no hang, no 500).
+        """
+        async def broken():
+            yield "partial "
+            raise RuntimeError("upstream died")
+
+        print("Action: Generating Anthropic SSE with a broken synthesis stream...")
+        events = [
+            e async for e in generate_anthropic_web_search_sse(
+                "claude-sonnet-4", "python", "srvtoolu_x", SAMPLE_RESULTS, 100,
+                synthesis_stream=broken()
+            )
+        ]
+        joined = "".join(events)
+        print("Checking partial text delivered and stream terminated...")
+        assert "partial " in joined
+        assert "message_stop" in events[-1]
+
+        print("Action: Same for OpenAI...")
+        chunks = [
+            c async for c in generate_openai_web_search_sse(
+                "claude-sonnet-4", "python", "srvtoolu_x", SAMPLE_RESULTS, 100,
+                synthesis_stream=broken()
+            )
+        ]
+        assert chunks[-1].strip() == "data: [DONE]"
+
+
+class TestHandleNativeWebSearchSynthesis:
+    """End-to-end (offline) checks of Path A with synthesis wired in."""
+
+    @staticmethod
+    def _request_data(stream):
+        from kiro.models_anthropic import AnthropicMessagesRequest
+        return AnthropicMessagesRequest(
+            model="claude-sonnet-4",
+            max_tokens=1024,
+            stream=stream,
+            messages=[{"role": "user", "content": "python 3.13 news"}],
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_appends_synthesis_block(self):
+        """
+        What it does: Path A non-streaming with a working continuation.
+        Purpose: Response carries the synthesised answer, not just the dump.
+        """
+        print("Setup: Patching MCP API and upstream continuation...")
+        client_patch, parse_patch, _ = _patch_upstream([_FakeEvent("content", "Synth answer.")])
+
+        with patch(
+            "kiro.mcp_tools.call_kiro_mcp_api",
+            AsyncMock(return_value=("srvtoolu_x", SAMPLE_RESULTS)),
+        ), client_patch, parse_patch:
+            print("Action: Calling handle_native_web_search...")
+            response = await handle_native_web_search(
+                Mock(), self._request_data(stream=False), _make_auth_manager(),
+                api_format="anthropic"
+            )
+
+        body = json.loads(response.body)
+        texts = [b["text"] for b in body["content"] if b["type"] == "text"]
+        print(f"Checking synthesis text present in: {texts}")
+        assert any("Synth answer." in t for t in texts)
+
+        print("Checking the raw summary is still present...")
+        assert any("<web_search>" in t for t in texts)
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_degrades_when_continuation_fails(self):
+        """
+        What it does: Continuation upstream fails; search itself succeeded.
+        Purpose: Must return 200 with the summary, not a 500.
+        """
+        print("Setup: Patching MCP API OK, continuation raising...")
+        client_patch, parse_patch, _ = _patch_upstream([], request_error=RuntimeError("boom"))
+
+        with patch(
+            "kiro.mcp_tools.call_kiro_mcp_api",
+            AsyncMock(return_value=("srvtoolu_x", SAMPLE_RESULTS)),
+        ), client_patch, parse_patch:
+            print("Action: Calling handle_native_web_search...")
+            response = await handle_native_web_search(
+                Mock(), self._request_data(stream=False), _make_auth_manager(),
+                api_format="anthropic"
+            )
+
+        print(f"Comparing status: Expected 200, Got {response.status_code}")
+        assert response.status_code == 200
+        body = json.loads(response.body)
+        texts = [b["text"] for b in body["content"] if b["type"] == "text"]
+        assert any("<web_search>" in t for t in texts)
+
+    @pytest.mark.asyncio
+    async def test_failed_search_still_returns_error_not_hang(self):
+        """
+        What it does: MCP search itself fails (results None).
+        Purpose: Existing contract preserved - a clean 500 error body, no hang.
+        """
+        print("Setup: Patching MCP API to fail...")
+        with patch(
+            "kiro.mcp_tools.call_kiro_mcp_api",
+            AsyncMock(return_value=(None, None)),
+        ):
+            print("Action: Calling handle_native_web_search...")
+            response = await handle_native_web_search(
+                Mock(), self._request_data(stream=True), _make_auth_manager(),
+                api_format="anthropic"
+            )
+
+        print(f"Comparing status: Expected 500, Got {response.status_code}")
+        assert response.status_code == 500
