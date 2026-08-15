@@ -41,6 +41,7 @@ from kiro.config import (
     verify_proxy_bearer_token,
     APP_VERSION,
     PROFILE_ARN,
+    MODEL_ALIASES,
 )
 from kiro.models_openai import (
     OpenAIModel,
@@ -174,7 +175,67 @@ async def health():
         "version": APP_VERSION
     }
 
-@router.get("/v1/models", response_model=ModelList, dependencies=[Depends(verify_api_key)])
+def collect_visible_models(request: Request):
+    """
+    Resolve the set of models this account may use, plus a metadata lookup for them.
+
+    This is the single source of the "visible model set": both /v1/models and
+    /integrations/opencode.json call it, so the two endpoints can never disagree.
+    HIDDEN_MODELS / HIDDEN_FROM_LIST filtering (which keeps "auto" out) already happens
+    inside the resolver / account manager that this helper delegates to.
+
+    Args:
+        request: FastAPI Request for accessing app.state
+
+    Returns:
+        (model_ids, metadata_for) where metadata_for(model_id) returns the additive
+        upstream metadata dict for that model, or {} when nothing is known.
+    """
+    if request.app.state.account_system:
+        # Account system: collect models from all initialized accounts
+        available_model_ids = request.app.state.account_manager.get_all_available_models()
+        caches = [
+            cache for cache in (
+                getattr(account, "model_cache", None)
+                for account in request.app.state.account_manager.iter_initialized_accounts()
+            ) if cache is not None
+        ]
+    else:
+        # Legacy: use resolver from first account
+        account = request.app.state.account_manager.get_first_account()
+        available_model_ids = account.model_resolver.get_available_models()
+        caches = [account.model_cache] if getattr(account, "model_cache", None) else []
+
+    def metadata_for(model_id: str) -> dict:
+        """
+        First cache that knows the model wins; a miss simply yields no extra fields.
+
+        A public alias (e.g. "auto-kiro") is only an entry in MODEL_ALIASES, never a
+        cache entry, so a direct lookup always misses. Such an id therefore falls back
+        to the metadata of the model it points at, single-hop, so the alias reports the
+        real upstream limits under its own public id. Nothing is fabricated: when the
+        target is unknown or metadata-free the result is still an empty dict.
+        """
+        candidates = [model_id]
+        alias_target = MODEL_ALIASES.get(model_id)
+        if isinstance(alias_target, str) and alias_target and alias_target != model_id:
+            candidates.append(alias_target)
+
+        for candidate in candidates:
+            for cache in caches:
+                try:
+                    metadata = cache.get_public_metadata(candidate)
+                except Exception as e:  # never let introspection break the endpoint
+                    logger.warning(f"Failed to read metadata for model {candidate}: {e}")
+                    continue
+                if metadata:
+                    return metadata
+        return {}
+
+    return available_model_ids, metadata_for
+
+
+@router.get("/v1/models", dependencies=[Depends(verify_api_key)])
 async def get_models(request: Request):
     """
     Return list of available models.
@@ -182,34 +243,186 @@ async def get_models(request: Request):
     Models are loaded at startup (blocking) and cached.
     This endpoint returns the cached list.
     
+    The envelope is unchanged ({"object": "list", "data": [...]}) and every entry keeps
+    its original id/object/created/owned_by/description fields. Upstream metadata (token
+    limits, input types, prompt caching, rate) is added ADDITIVELY per entry and omitted
+    whenever it is unknown — e.g. for static FALLBACK_MODELS entries, which then render
+    exactly as before. Because entries carry optional extra keys, the response is
+    serialized from validated OpenAIModel base fields plus the metadata overlay instead
+    of through a fixed response_model.
+    
     Args:
         request: FastAPI Request for accessing app.state
     
     Returns:
-        ModelList with available models in consistent format (with dots)
+        ModelList-shaped dict with available models in consistent format (with dots)
     """
     logger.info("Request to /v1/models")
     
-    # Get available models based on mode
-    if request.app.state.account_system:
-        # Account system: collect models from all initialized accounts
-        available_model_ids = request.app.state.account_manager.get_all_available_models()
-    else:
-        # Legacy: use resolver from first account
-        account = request.app.state.account_manager.get_first_account()
-        available_model_ids = account.model_resolver.get_available_models()
+    available_model_ids, metadata_for = collect_visible_models(request)
     
     # Build OpenAI-compatible model list
     openai_models = [
-        OpenAIModel(
-            id=model_id,
-            owned_by="anthropic",
-            description="Claude model via Kiro API"
-        )
+        {
+            **OpenAIModel(
+                id=model_id,
+                owned_by="anthropic",
+                description="Claude model via Kiro API"
+            ).model_dump(),
+            **metadata_for(model_id),
+        }
         for model_id in available_model_ids
     ]
     
-    return ModelList(data=openai_models)
+    return {"object": "list", "data": openai_models}
+
+
+# OpenCode does not auto-discover models for custom providers (upstream OpenCode issue
+# #6231 is still open), so every model must be listed explicitly in opencode.json.
+OPENCODE_API_KEY_PLACEHOLDER = "{env:KIRO_GATEWAY_KEY}"
+OPENCODE_NPM_PACKAGE = "@ai-sdk/openai-compatible"
+OPENCODE_SCHEMA_URL = "https://opencode.ai/config.json"
+# Field the gateway uses for OpenAI-style reasoning text, surfaced only when ?reasoning=true.
+OPENCODE_REASONING_FIELD = "reasoning_content"
+
+
+def _derive_base_url(request: Request) -> str:
+    """
+    Derive the gateway's OpenAI-compatible base URL from the incoming request.
+
+    Using the request's own scheme/host means a caller reaching the gateway through
+    Docker, a hostname or a reverse proxy gets a value that actually works for them,
+    instead of a hardcoded localhost.
+
+    Returns:
+        e.g. "http://localhost:8000/v1" (always ends in "/v1")
+    """
+    return str(request.base_url).rstrip("/") + "/v1"
+
+
+def build_opencode_config(
+    model_ids,
+    metadata_for,
+    provider_id: str,
+    base_url: str,
+    api_key: str,
+    reasoning: bool,
+) -> dict:
+    """
+    Build an OpenCode provider config document.
+
+    Only fields documented at https://opencode.ai/docs/en/providers/ are emitted. The
+    upstream catalog exposes more metadata (input types, prompt caching, rate), but
+    OpenCode has no schema slot for it, so it is deliberately dropped rather than
+    invented as non-standard keys.
+
+    `limit` is emitted only when the upstream catalog actually reports the numbers; a
+    model with unknown limits gets no `limit` key at all rather than a guessed one.
+
+    Args:
+        model_ids: Visible model ids (already hidden-model filtered)
+        metadata_for: Callable(model_id) -> upstream metadata dict
+        provider_id: Provider key under "provider"
+        base_url: Value for options.baseURL
+        api_key: Value for options.apiKey — a placeholder string, never a real secret
+        reasoning: Whether to emit the (unverified) reasoning/interleaved pair
+
+    Returns:
+        A JSON-serializable OpenCode config dict
+    """
+    models: dict = {}
+    for model_id in model_ids:
+        metadata = metadata_for(model_id) or {}
+        entry: dict = {"name": metadata.get("display_name") or model_id}
+
+        limit = {}
+        max_input = metadata.get("max_input_tokens")
+        max_output = metadata.get("max_output_tokens")
+        if isinstance(max_input, int) and not isinstance(max_input, bool):
+            limit["context"] = max_input
+        if isinstance(max_output, int) and not isinstance(max_output, bool):
+            limit["output"] = max_output
+        if limit:
+            entry["limit"] = limit
+
+        if reasoning:
+            entry["reasoning"] = True
+            entry["interleaved"] = {"field": OPENCODE_REASONING_FIELD}
+
+        models[model_id] = entry
+
+    return {
+        "$schema": OPENCODE_SCHEMA_URL,
+        "provider": {
+            provider_id: {
+                "npm": OPENCODE_NPM_PACKAGE,
+                "name": "Kiro Gateway",
+                "options": {
+                    "baseURL": base_url,
+                    "apiKey": api_key,
+                },
+                "models": models,
+            }
+        },
+    }
+
+
+@router.get("/integrations/opencode.json", dependencies=[Depends(verify_api_key)])
+async def get_opencode_config(
+    request: Request,
+    provider: str = "kiro",
+    base_url: str = None,
+    api_key: str = None,
+    reasoning: bool = False,
+):
+    """
+    Return a ready-to-paste OpenCode provider config for THIS account's model catalog.
+
+    Why generated instead of shipped as a static file: /ListAvailableModels is
+    authenticated and per-account, so a free-tier account genuinely sees fewer models
+    than a paid one. A checked-in opencode.json would misrepresent entitlements. The
+    model set comes from the same resolver as /v1/models (see collect_visible_models),
+    so the two endpoints can never disagree and hidden models such as "auto" stay out.
+
+    The document is returned as JSON only — nothing is ever written to disk. Users merge
+    it into their own opencode.json, which also holds their agents/plugins/MCP config.
+
+    options.apiKey defaults to the literal "{env:KIRO_GATEWAY_KEY}" placeholder, which
+    OpenCode resolves itself. The server's configured PROXY_API_KEY is never read here,
+    so it cannot leak into the document. A caller-supplied ?api_key= is echoed verbatim.
+
+    Args:
+        request: FastAPI Request (also used to derive baseURL)
+        provider: Provider id key (default "kiro")
+        base_url: Override for options.baseURL (default: derived from this request)
+        api_key: Override for the options.apiKey placeholder text
+        reasoning: Emit "reasoning": true + "interleaved": {"field": "reasoning_content"}.
+                   Defaults to FALSE: the gateway does emit OpenAI reasoning_content and
+                   the docs' Poolside example implies this pair is what surfaces it, but
+                   that has NOT been verified against a real OpenCode session, so it is
+                   opt-in rather than enabled for every model at once.
+
+    Returns:
+        Pretty-printed OpenCode config JSON
+    """
+    logger.info("Request to /integrations/opencode.json")
+
+    model_ids, metadata_for = collect_visible_models(request)
+
+    config = build_opencode_config(
+        model_ids=model_ids,
+        metadata_for=metadata_for,
+        provider_id=provider or "kiro",
+        base_url=base_url or _derive_base_url(request),
+        api_key=api_key if api_key else OPENCODE_API_KEY_PLACEHOLDER,
+        reasoning=reasoning,
+    )
+
+    # Pretty-printed so the response is directly pasteable into opencode.json.
+    return Response(
+        content=json.dumps(config, indent=2, ensure_ascii=False) + "\n",
+        media_type="application/json",
+    )
 
 
 @router.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])

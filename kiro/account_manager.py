@@ -70,6 +70,15 @@ from kiro.account_errors import ErrorType
 from kiro.http_client import KiroHttpClient
 
 
+# --- Model-discovery pagination caps -------------------------------------------------
+# ListAvailableModels is paginated via a top-level "nextToken". Both caps are hard
+# safety limits: a broken or hostile upstream that always returns a nextToken (or an
+# unbounded catalog) must not spin forever or exhaust memory. 19 models fit on one page
+# today, so in practice neither cap is reached.
+MODEL_DISCOVERY_MAX_PAGES: int = 10
+MODEL_DISCOVERY_MAX_MODELS: int = 500
+
+
 def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
     """
     Check if auth manager uses the runtime (streaming) endpoint.
@@ -691,36 +700,91 @@ class AccountManager:
         list_models_url = f"{_get_model_listing_host(auth_manager)}/ListAvailableModels"
         
         http_client = KiroHttpClient(auth_manager, shared_client=None)
-        try:
-            response = await asyncio.wait_for(
-                http_client.request_with_retry(
+        
+        async def _fetch_all_pages() -> tuple:
+            """
+            Follow nextToken across pages, returning (models, failure_reason).
+            
+            Page 1 uses exactly the same params as before (no extra keys), so the
+            request shape for single-page accounts is unchanged. Subsequent pages add
+            "nextToken". Bounded by MODEL_DISCOVERY_MAX_PAGES and
+            MODEL_DISCOVERY_MAX_MODELS. A failure on page 1 is fatal (caller falls back);
+            a failure on a later page keeps whatever was already collected.
+            """
+            collected: List[Dict] = []
+            seen_ids = set()
+            next_token = None
+            
+            for page in range(1, MODEL_DISCOVERY_MAX_PAGES + 1):
+                page_params = dict(params)
+                if next_token:
+                    page_params["nextToken"] = next_token
+                
+                response = await http_client.request_with_retry(
                     method="GET",
                     url=list_models_url,
                     json_data=None,
-                    params=params,
+                    params=page_params,
                     stream=False,
-                ),
+                )
+                
+                status = getattr(response, "status_code", None)
+                if status != 200:
+                    return collected, f"HTTP {status} from {list_models_url} (page {page})"
+                
+                data = response.json()
+                if not isinstance(data, dict):
+                    return collected, f"response body is not a JSON object (page {page})"
+                
+                raw_models = data.get("models")
+                if not isinstance(raw_models, list) or not raw_models:
+                    return collected, f"response contained no usable 'models' array (page {page})"
+                
+                for model in raw_models:
+                    if not isinstance(model, dict):
+                        continue
+                    model_id = model.get("modelId")
+                    if not isinstance(model_id, str) or not model_id or model_id in seen_ids:
+                        continue
+                    seen_ids.add(model_id)
+                    collected.append(model)
+                
+                if len(collected) >= MODEL_DISCOVERY_MAX_MODELS:
+                    logger.warning(
+                        f"Account {account_id}: model discovery hit the "
+                        f"{MODEL_DISCOVERY_MAX_MODELS}-model cap; ignoring further pages."
+                    )
+                    return collected, None
+                
+                next_token = data.get("nextToken")
+                if not isinstance(next_token, str) or not next_token:
+                    return collected, None
+                
+                if page == MODEL_DISCOVERY_MAX_PAGES:
+                    logger.warning(
+                        f"Account {account_id}: model discovery hit the "
+                        f"{MODEL_DISCOVERY_MAX_PAGES}-page cap; ignoring further pages."
+                    )
+            
+            return collected, None
+        
+        try:
+            models, failure_reason = await asyncio.wait_for(
+                _fetch_all_pages(),
                 timeout=MODEL_DISCOVERY_TIMEOUT,
             )
             
-            status = getattr(response, "status_code", None)
-            if status != 200:
-                return self._discovery_failed(account_id, f"HTTP {status} from {list_models_url}")
-            
-            data = response.json()
-            if not isinstance(data, dict):
-                return self._discovery_failed(account_id, "response body is not a JSON object")
-            
-            raw_models = data.get("models")
-            if not isinstance(raw_models, list) or not raw_models:
-                return self._discovery_failed(account_id, "response contained no usable 'models' array")
-            
-            models = [
-                model for model in raw_models
-                if isinstance(model, dict) and isinstance(model.get("modelId"), str) and model["modelId"]
-            ]
             if not models:
-                return self._discovery_failed(account_id, "no entry in 'models' had a usable modelId")
+                return self._discovery_failed(
+                    account_id,
+                    failure_reason or "no entry in 'models' had a usable modelId",
+                )
+            
+            if failure_reason:
+                logger.warning(
+                    f"Account {account_id}: model discovery stopped early "
+                    f"({failure_reason}); keeping the {len(models)} model(s) collected."
+                )
             
             logger.info(
                 f"Account {account_id}: discovered {len(models)} model(s) from {list_models_url}"
@@ -1161,6 +1225,20 @@ class AccountManager:
             if account.auth_manager is not None:
                 return account
         raise RuntimeError("No initialized accounts available")
+    
+    def iter_initialized_accounts(self):
+        """
+        Yield every account whose auth_manager has been initialized.
+        
+        Public read-only accessor for introspection (e.g. building the /v1/models
+        response) so callers do not reach into self._accounts directly.
+        
+        Yields:
+            Account: initialized accounts, in insertion order.
+        """
+        for account in self._accounts.values():
+            if account.auth_manager is not None:
+                yield account
     
     def get_all_available_models(self) -> List[str]:
         """

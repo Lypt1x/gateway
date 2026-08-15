@@ -124,6 +124,103 @@ class ModelInfoCache:
             return None
         return model.get(field)
     
+    def get_public_metadata(self, model_id: str) -> Dict[str, Any]:
+        """
+        Return the upstream metadata for a model in public (snake_case) form.
+        
+        Only fields actually reported by ListAvailableModels are returned; anything
+        absent, null or of an unexpected type is omitted rather than defaulted, so
+        callers can never publish a fabricated limit. A model that carries no metadata
+        at all (e.g. an entry from the static FALLBACK_MODELS list, which has only
+        "modelId") yields an empty dict.
+        
+        Synthetic entries created by add_hidden_model() (public aliases such as
+        "auto-kiro") carry no upstream metadata of their own — their tokenLimits are a
+        local default, not an upstream measurement — so they INHERIT the metadata of the
+        internal model they point at ("_internal_id"). Only metadata is inherited; the
+        alias keeps its own public id, which this method never emits. When the internal
+        model is itself unknown or metadata-free (e.g. a static FALLBACK_MODELS entry),
+        the result is an empty dict, exactly as before.
+        
+        Args:
+            model_id: Model ID
+        
+        Returns:
+            Dict with any of: display_name, context_length, max_input_tokens,
+            max_output_tokens, supported_input_types, supports_prompt_caching,
+            max_cache_checkpoints, min_tokens_per_cache_checkpoint, rate_multiplier,
+            rate_unit. Empty dict when nothing is known.
+        """
+        model = self._cache.get(model_id)
+        if not model:
+            return {}
+        if model.get("_is_hidden"):
+            internal_id = model.get("_internal_id")
+            if not isinstance(internal_id, str) or not internal_id or internal_id == model_id:
+                return {}
+            target = self._cache.get(internal_id)
+            # Only a real upstream entry may be inherited from; a chain of synthetic
+            # entries would have nothing measured to offer.
+            if not target or target.get("_is_hidden"):
+                return {}
+            return self._extract_public_metadata(target)
+        
+        return self._extract_public_metadata(model)
+    
+    @staticmethod
+    def _extract_public_metadata(model: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Project one raw upstream model entry into public (snake_case) metadata.
+        
+        Anything absent, null or of an unexpected type is omitted rather than defaulted,
+        so a caller can never publish a fabricated limit.
+        """
+        out: Dict[str, Any] = {}
+        
+        display_name = model.get("modelName")
+        if isinstance(display_name, str) and display_name:
+            out["display_name"] = display_name
+        
+        token_limits = model.get("tokenLimits")
+        if isinstance(token_limits, dict):
+            max_input = token_limits.get("maxInputTokens")
+            max_output = token_limits.get("maxOutputTokens")
+            if isinstance(max_input, int) and not isinstance(max_input, bool):
+                # context_length mirrors max_input_tokens (naming precedent from
+                # upstream PR #156); both are published so either convention works.
+                out["context_length"] = max_input
+                out["max_input_tokens"] = max_input
+            if isinstance(max_output, int) and not isinstance(max_output, bool):
+                out["max_output_tokens"] = max_output
+        
+        input_types = model.get("supportedInputTypes")
+        if isinstance(input_types, list):
+            cleaned = [t for t in input_types if isinstance(t, str) and t]
+            if cleaned:
+                out["supported_input_types"] = cleaned
+        
+        caching = model.get("promptCaching")
+        if isinstance(caching, dict):
+            supported = caching.get("supportsPromptCaching")
+            if isinstance(supported, bool):
+                out["supports_prompt_caching"] = supported
+            checkpoints = caching.get("maximumCacheCheckpointsPerRequest")
+            if isinstance(checkpoints, int) and not isinstance(checkpoints, bool):
+                out["max_cache_checkpoints"] = checkpoints
+            min_tokens = caching.get("minimumTokensPerCacheCheckpoint")
+            if isinstance(min_tokens, int) and not isinstance(min_tokens, bool):
+                out["min_tokens_per_cache_checkpoint"] = min_tokens
+        
+        rate_multiplier = model.get("rateMultiplier")
+        if isinstance(rate_multiplier, (int, float)) and not isinstance(rate_multiplier, bool):
+            out["rate_multiplier"] = rate_multiplier
+        
+        rate_unit = model.get("rateUnit")
+        if isinstance(rate_unit, str) and rate_unit:
+            out["rate_unit"] = rate_unit
+        
+        return out
+    
     def get(self, model_id: str) -> Optional[Dict[str, Any]]:
         """
         Returns model information.
