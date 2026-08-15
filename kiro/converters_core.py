@@ -436,6 +436,91 @@ def inject_thinking_tags(content: str, thinking_config: ThinkingConfig) -> str:
 # JSON Schema Sanitization
 # ==================================================================================================
 
+def _resolve_schema_composition(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Resolves top-level composition keywords (allOf/oneOf/anyOf) of a single schema node.
+    
+    - allOf: shallow-merges member ``properties`` and unions member ``required``.
+    - oneOf/anyOf: collapses to the first member declaring ``properties``, merging that
+      member's keys into the parent and dropping the keyword. Member ``required`` is NOT
+      unioned, because members are alternatives and a union would over-constrain.
+    
+    Nodes without composition keywords (or whose members declare no ``properties``) are
+    returned as an unmodified shallow copy, preserving key order.
+    
+    Args:
+        schema: single JSON Schema node
+    
+    Returns:
+        Shallow copy of the node with composition resolved
+    """
+    node = dict(schema)
+    
+    members = node.get("allOf")
+    if isinstance(members, list) and any(
+        isinstance(m, dict) and isinstance(m.get("properties"), dict) for m in members
+    ):
+        merged_properties: Dict[str, Any] = {}
+        merged_required: List[Any] = []
+        inherited: Dict[str, Any] = {}
+        
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            for key, value in member.items():
+                if key == "properties" and isinstance(value, dict):
+                    merged_properties.update(value)
+                elif key == "required" and isinstance(value, list):
+                    for name in value:
+                        if name not in merged_required:
+                            merged_required.append(name)
+                else:
+                    inherited.setdefault(key, value)
+        
+        node.pop("allOf", None)
+        
+        properties = dict(node.get("properties") or {})
+        properties.update(merged_properties)
+        node["properties"] = properties
+        
+        required = list(node.get("required") or [])
+        for name in merged_required:
+            if name not in required:
+                required.append(name)
+        if required:
+            node["required"] = required
+        
+        for key, value in inherited.items():
+            node.setdefault(key, value)
+    
+    for keyword in ("oneOf", "anyOf"):
+        members = node.get(keyword)
+        if not isinstance(members, list):
+            continue
+        chosen = next(
+            (m for m in members if isinstance(m, dict) and isinstance(m.get("properties"), dict)),
+            None,
+        )
+        if chosen is None:
+            # No member carries a concrete object shape - leave the keyword alone.
+            continue
+        
+        node.pop(keyword, None)
+        
+        properties = dict(node.get("properties") or {})
+        for key, value in chosen.items():
+            if key == "properties":
+                properties.update(value)
+            elif key == "required":
+                # Alternatives: unioning required would over-constrain the schema.
+                continue
+            else:
+                node.setdefault(key, value)
+        node["properties"] = properties
+    
+    return node
+
+
 def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Sanitizes JSON Schema from fields that Kiro API doesn't accept.
@@ -443,8 +528,11 @@ def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     Kiro API returns 400 "Improperly formed request" error if:
     - required is an empty array []
     - additionalProperties is present in schema
+    - composition keywords (allOf/oneOf/anyOf) are used to describe the object shape
+    - required names a property that does not exist
     
-    This function recursively processes the schema and removes problematic fields.
+    This function recursively processes the schema, resolves composition keywords and
+    removes problematic fields.
     
     Args:
         schema: JSON Schema to sanitize
@@ -455,7 +543,9 @@ def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not schema:
         return {}
     
-    result = {}
+    schema = _resolve_schema_composition(schema)
+    
+    result: Dict[str, Any] = {}
     
     for key, value in schema.items():
         # Skip empty required arrays
@@ -482,6 +572,16 @@ def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             ]
         else:
             result[key] = value
+    
+    # required must only ever name properties that actually exist in the sibling map.
+    required = result.get("required")
+    properties = result.get("properties")
+    if isinstance(required, list) and isinstance(properties, dict):
+        filtered = [name for name in required if name in properties]
+        if filtered:
+            result["required"] = filtered
+        else:
+            del result["required"]
     
     return result
 

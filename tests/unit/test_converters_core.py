@@ -11,6 +11,7 @@ Tests for shared conversion logic used by both OpenAI and Anthropic adapters:
 - Thinking tag injection
 """
 
+import json
 import os
 import pytest
 from unittest.mock import patch
@@ -2775,6 +2776,183 @@ class TestSanitizeJsonSchema:
         assert "additionalProperties" not in result
         assert result["required"] == ["question", "options"]  # Non-empty required is preserved
         assert result["properties"]["question"]["type"] == "string"
+
+
+class TestSanitizeJsonSchemaComposition:
+    """
+    Tests for FIX-02: composition keywords (allOf/oneOf/anyOf) and invalid required.
+    
+    Kiro API rejects composition keywords and required entries naming properties that
+    do not exist, producing an opaque upstream 400 "Improperly formed request".
+    """
+    
+    def test_top_level_all_of_merges_properties_and_unions_required(self):
+        """
+        What it does: Verifies allOf members are shallow-merged.
+        Purpose: Ensure properties merge and required is unioned across members.
+        """
+        print("Setup: Schema with top-level allOf of two property groups...")
+        schema = {
+            "type": "object",
+            "allOf": [
+                {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+                {"properties": {"b": {"type": "number"}}, "required": ["b"]},
+            ],
+        }
+        
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+        
+        print(f"Result: {result}")
+        assert "allOf" not in result
+        assert set(result["properties"]) == {"a", "b"}
+        assert result["properties"]["b"]["type"] == "number"
+        assert sorted(result["required"]) == ["a", "b"]
+    
+    def test_one_of_collapses_to_first_concrete_member(self):
+        """
+        What it does: Verifies oneOf collapses to first member declaring properties.
+        Purpose: Ensure the keyword is dropped and member required is NOT unioned.
+        """
+        print("Setup: Schema with oneOf of two alternatives...")
+        schema = {
+            "type": "object",
+            "oneOf": [
+                {"properties": {"by_id": {"type": "string"}}, "required": ["by_id"]},
+                {"properties": {"by_name": {"type": "string"}}, "required": ["by_name"]},
+            ],
+        }
+        
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+        
+        print(f"Result: {result}")
+        assert "oneOf" not in result
+        assert list(result["properties"]) == ["by_id"]
+        # Members are alternatives - member required is not carried over (no over-constraining).
+        assert "required" not in result
+    
+    def test_any_of_collapses_to_first_concrete_member(self):
+        """
+        What it does: Verifies anyOf is collapsed like oneOf.
+        Purpose: Ensure anyOf never reaches the Kiro payload.
+        """
+        print("Setup: Schema with anyOf where first member is concrete...")
+        schema = {
+            "type": "object",
+            "anyOf": [
+                {"properties": {"query": {"type": "string"}}},
+                {"properties": {"filter": {"type": "object"}}},
+            ],
+        }
+        
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+        
+        print(f"Result: {result}")
+        assert "anyOf" not in result
+        assert list(result["properties"]) == ["query"]
+    
+    def test_required_naming_missing_property_is_filtered(self):
+        """
+        What it does: Verifies required entries without a matching property are dropped.
+        Purpose: Ensure required only ever names existing properties.
+        """
+        print("Setup: Schema whose required names a non-existent property...")
+        schema = {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": ["location", "ghost"],
+        }
+        
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+        
+        print(f"Result: {result}")
+        assert result["required"] == ["location"]
+    
+    def test_required_reduced_to_empty_is_dropped(self):
+        """
+        What it does: Verifies required is removed when nothing survives filtering.
+        Purpose: Reuse the existing empty-required skip so Kiro never sees required: [].
+        """
+        print("Setup: Schema whose required names only missing properties...")
+        schema = {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": ["ghost"],
+        }
+        
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+        
+        print(f"Result: {result}")
+        assert "required" not in result
+        assert result["properties"]["location"]["type"] == "string"
+    
+    def test_nested_composition_inside_property_is_resolved(self):
+        """
+        What it does: Verifies composition nested inside properties is resolved.
+        Purpose: Ensure sanitization is applied recursively.
+        """
+        print("Setup: Schema with allOf/oneOf nested inside a property...")
+        schema = {
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "object",
+                    "allOf": [
+                        {"properties": {"host": {"type": "string"}}, "required": ["host"]},
+                        {
+                            "properties": {
+                                "port": {
+                                    "oneOf": [
+                                        {"properties": {"num": {"type": "number"}}},
+                                        {"properties": {"name": {"type": "string"}}},
+                                    ]
+                                }
+                            }
+                        },
+                    ],
+                }
+            },
+        }
+        
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+        
+        print(f"Result: {result}")
+        target = result["properties"]["target"]
+        assert "allOf" not in target
+        assert set(target["properties"]) == {"host", "port"}
+        assert target["required"] == ["host"]
+        port = target["properties"]["port"]
+        assert "oneOf" not in port
+        assert list(port["properties"]) == ["num"]
+    
+    def test_schema_without_composition_is_byte_identical(self):
+        """
+        What it does: Verifies schemas without composition and with valid required are unchanged.
+        Purpose: Guard against collateral change from FIX-02 (explicit acceptance criterion).
+        """
+        print("Setup: Valid schema without composition...")
+        schema = {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path"},
+                "depth": {"type": "integer", "enum": [1, 2, 3]},
+                "tags": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["path"],
+            "description": "Read a file",
+        }
+        expected = json.dumps(schema, sort_keys=False)
+        
+        print("Action: Sanitizing schema...")
+        result = sanitize_json_schema(schema)
+        
+        print(f"Result: {result}")
+        assert json.dumps(result, sort_keys=False) == expected
 
 
 # ==================================================================================================
