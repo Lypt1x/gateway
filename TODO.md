@@ -119,6 +119,18 @@ plain completions worked, and the full agentic tool loop wrote files correctly o
 
 ## 6. Feature gaps and accuracy
 
+- [ ] Context accounting: upstream's `contextUsageEvent` model in the kiro-cli binary declares
+      `total_tokens`, `uncached_input_tokens`, `output_tokens`, `cache_read_input_tokens` and
+      `cache_write_input_tokens`, but real frames carry **only** `contextUsagePercentage`
+      (verified across three request shapes and two models). We therefore still invert the
+      percentage against the model's `maxInputTokens` instead of reading exact counts. The
+      parser now logs the payload's key names once per stream at DEBUG, so if upstream starts
+      populating those fields we will notice and can consume them directly.
+- [ ] `/v1/messages/count_tokens` cannot use the percentage at all, because it is only emitted
+      after generation. That path is still a `cl100k_base` estimate with a ~15% correction for
+      Claude's different vocabulary, so it will always drift from the real count.
+- [ ] Cache read/write token accounting is not reported anywhere, though every model in the
+      catalog advertises `promptCaching` support.
 - [ ] `#176` document blocks for textual media types (only a PDF was tested, which correctly
       degrades to a "cannot read" placeholder since Kiro has no document channel)
 - [ ] `count_tokens` accuracy against real upstream usage numbers, not just internal consistency
