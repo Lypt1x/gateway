@@ -1057,3 +1057,145 @@ class TestTokenizerIntegration:
         assert len(set(results)) == 1, "Results should be consistent"
     
     
+
+
+
+# ==================================================================================================
+# FIX-08: tokenizer offline resilience (local cache, bounded retry, approximate fallback)
+# ==================================================================================================
+
+import os  # noqa: E402
+import sys  # noqa: E402
+
+import kiro.tokenizer as tokenizer_module  # noqa: E402
+from kiro.tokenizer import (  # noqa: E402
+    approximate_token_count,
+    reset_encoding_cache,
+    TOKENIZER_LOAD_ATTEMPTS,
+    FALLBACK_CHARS_PER_TOKEN,
+)
+
+
+@pytest.fixture
+def fresh_encoding():
+    """Reset the memoized encoding before and after, so tests cannot leak state."""
+    original = tokenizer_module._encoding
+    reset_encoding_cache()
+    yield
+    tokenizer_module._encoding = original
+
+
+class TestTokenizerOfflineResilience:
+    """Tests for local cache, retry with backoff, and approximate fallback."""
+
+    def test_cache_dir_prepared_and_used(self, tmp_path, monkeypatch, fresh_encoding):
+        """
+        What it does: points TIKTOKEN_CACHE_DIR at a temp dir and loads the encoding.
+        Purpose: encoding must resolve from a local cache directory, not an implicit one.
+        """
+        monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(tmp_path / "tk"))
+        cache_dir = tokenizer_module._prepare_tiktoken_cache()
+        assert cache_dir == str(tmp_path / "tk")
+        assert (tmp_path / "tk").is_dir()
+        assert os.environ["TIKTOKEN_CACHE_DIR"] == str(tmp_path / "tk")
+
+    def test_resolves_from_local_cache_with_network_failing(self, tmp_path, monkeypatch, fresh_encoding):
+        """
+        What it does: stubs tiktoken so the first (network) call fails and a cached load succeeds.
+        Purpose: an offline host with a warm cache must still get a real encoder.
+        """
+        monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(tmp_path / "tk"))
+        real = MagicMock()
+        real.encode = lambda text: list(range(len(text)))
+        calls = []
+
+        def fake_get_encoding(name):
+            calls.append(name)
+            if len(calls) == 1:
+                raise ConnectionError("openaipublic.blob.core.windows.net unreachable")
+            return real
+
+        fake_tiktoken = MagicMock()
+        fake_tiktoken.get_encoding = fake_get_encoding
+        monkeypatch.setitem(sys.modules, "tiktoken", fake_tiktoken)
+        monkeypatch.setattr(tokenizer_module.time, "sleep", lambda _s: None)
+
+        encoding = _get_encoding()
+        assert encoding is real, "Should resolve encoding after cached retry"
+        assert calls == ["cl100k_base", "cl100k_base"]
+
+    def test_retry_path_is_bounded_with_backoff(self, monkeypatch, fresh_encoding):
+        """
+        What it does: makes every load attempt fail and records the backoff sleeps.
+        Purpose: retries must be bounded and use exponential backoff.
+        """
+        attempts = []
+        sleeps = []
+
+        def always_fail(name):
+            attempts.append(name)
+            raise ConnectionError("no network")
+
+        fake_tiktoken = MagicMock()
+        fake_tiktoken.get_encoding = always_fail
+        monkeypatch.setitem(sys.modules, "tiktoken", fake_tiktoken)
+        monkeypatch.setattr(tokenizer_module.time, "sleep", lambda s: sleeps.append(s))
+
+        encoding = _get_encoding()
+        assert encoding is None, "Should give up and signal fallback"
+        assert len(attempts) == TOKENIZER_LOAD_ATTEMPTS
+        # One sleep fewer than attempts, each doubling.
+        assert len(sleeps) == TOKENIZER_LOAD_ATTEMPTS - 1
+        assert sleeps == sorted(sleeps)
+        if len(sleeps) >= 2:
+            assert sleeps[1] == pytest.approx(sleeps[0] * 2)
+
+    def test_approximate_count_returned_instead_of_exception(self, monkeypatch, fresh_encoding):
+        """
+        What it does: makes the encoder permanently unavailable and counts tokens anyway.
+        Purpose: token counting must never take down a request.
+        """
+        fake_tiktoken = MagicMock()
+        fake_tiktoken.get_encoding = lambda name: (_ for _ in ()).throw(ConnectionError("offline"))
+        monkeypatch.setitem(sys.modules, "tiktoken", fake_tiktoken)
+        monkeypatch.setattr(tokenizer_module.time, "sleep", lambda _s: None)
+
+        text = "Hello, world! " * 10
+        result = count_tokens(text)
+        expected = int(approximate_token_count(text) * CLAUDE_CORRECTION_FACTOR)
+        assert result == expected > 0
+
+        # Higher-level helpers must also survive.
+        assert count_message_tokens([{"role": "user", "content": text}]) > 0
+        assert estimate_request_tokens([{"role": "user", "content": text}])["total_tokens"] > 0
+
+    def test_encode_exception_falls_back_without_raising(self, fresh_encoding):
+        """
+        What it does: supplies an encoder whose encode() raises.
+        Purpose: runtime encode failures must degrade to approximation, not propagate.
+        """
+        broken = MagicMock()
+        broken.encode.side_effect = RuntimeError("corrupt bpe ranks")
+        tokenizer_module._encoding = broken
+
+        text = "some text to count"
+        assert count_tokens(text) == int(approximate_token_count(text) * CLAUDE_CORRECTION_FACTOR)
+
+    def test_approximate_token_count_formula(self):
+        """
+        What it does: checks the approximate estimator's arithmetic and empty input.
+        Purpose: fallback counts stay stable and documented (~4 chars/token).
+        """
+        assert approximate_token_count("") == 0
+        assert approximate_token_count("a" * 40) == 40 // FALLBACK_CHARS_PER_TOKEN + 1
+
+    def test_real_encoder_path_counts_unchanged(self, fresh_encoding):
+        """
+        What it does: counts with the real encoder (if installed) and compares to raw encode().
+        Purpose: exact counts on the normal path must not change - usage reporting depends on it.
+        """
+        encoding = _get_encoding()
+        if encoding is None:
+            pytest.skip("tiktoken encoding unavailable in this environment")
+        text = "The quick brown fox jumps over the lazy dog."
+        assert count_tokens(text, apply_claude_correction=False) == len(encoding.encode(text))

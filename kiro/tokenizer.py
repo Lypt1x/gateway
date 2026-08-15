@@ -33,6 +33,9 @@ more than GPT-4 (cl100k_base). This is due to differences in BPE vocabularies.
 """
 
 import json
+import os
+import time
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 from loguru import logger
 
@@ -44,6 +47,58 @@ _encoding = None
 # This is an empirical value based on comparison with context_usage from API
 CLAUDE_CORRECTION_FACTOR = 1.15
 
+# ------------------------------------------------------------------------------------------------
+# Offline resilience for the cl100k_base encoding
+# ------------------------------------------------------------------------------------------------
+# tiktoken downloads cl100k_base from a CDN on first use. On an offline or locked-down host that
+# fails with no retry, which used to make token counting raise. Two mitigations:
+#   1. Point tiktoken at a local, writable cache directory so the encoding is downloaded at most
+#      once per deployment and resolved from disk afterwards (works fully offline).
+#   2. Bounded retry with exponential backoff around the load, then an APPROXIMATE character-based
+#      count instead of an exception. Token counting must never take down a request.
+# Note: when the real encoder loads, counts are unchanged - exactness matters for usage reporting.
+
+# Number of load attempts (1 initial + retries) before giving up and using approximation.
+TOKENIZER_LOAD_ATTEMPTS = 3
+
+# Base delay in seconds for exponential backoff between load attempts.
+TOKENIZER_RETRY_BASE_DELAY = 0.5
+
+# Default on-disk cache location, overridable via TIKTOKEN_CACHE_DIR.
+DEFAULT_TIKTOKEN_CACHE_DIR = Path(__file__).resolve().parent.parent / ".tiktoken_cache"
+
+# Approximate characters per token used by the fallback estimator.
+FALLBACK_CHARS_PER_TOKEN = 4
+
+
+def _prepare_tiktoken_cache() -> Optional[str]:
+    """
+    Ensure tiktoken has a local cache directory to read from / write to.
+
+    tiktoken honours the TIKTOKEN_CACHE_DIR environment variable. If the operator already set
+    it, it is respected as-is. Otherwise a repository-local directory is used so a single
+    successful download keeps working on subsequent offline starts.
+
+    Returns:
+        The cache directory path, or None if no usable directory could be prepared.
+    """
+    configured = os.environ.get("TIKTOKEN_CACHE_DIR")
+    cache_dir = Path(configured) if configured else DEFAULT_TIKTOKEN_CACHE_DIR
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning(f"[Tokenizer] Cannot prepare tiktoken cache dir '{cache_dir}': {e}")
+        return configured if configured else None
+
+    os.environ["TIKTOKEN_CACHE_DIR"] = str(cache_dir)
+    return str(cache_dir)
+
+
+def reset_encoding_cache() -> None:
+    """Reset the memoized encoding so it is resolved again on next use (used by tests)."""
+    global _encoding
+    _encoding = None
+
 
 def _get_encoding():
     """
@@ -51,16 +106,17 @@ def _get_encoding():
     
     Uses cl100k_base - encoding for GPT-4/ChatGPT,
     which is close enough to Claude tokenization.
-    
+
+    Resolves from a local cache when available, retries transient/network failures with
+    exponential backoff, and returns None (triggering approximate counting) instead of raising.
+
     Returns:
-        tiktoken.Encoding or None if tiktoken is unavailable
+        tiktoken.Encoding or None if the encoding could not be loaded
     """
     global _encoding
     if _encoding is None:
         try:
             import tiktoken
-            _encoding = tiktoken.get_encoding("cl100k_base")
-            logger.debug("[Tokenizer] Initialized tiktoken with cl100k_base encoding")
         except ImportError:
             logger.warning(
                 "[Tokenizer] tiktoken not installed. "
@@ -68,10 +124,54 @@ def _get_encoding():
                 "Install with: pip install tiktoken"
             )
             _encoding = False  # Marker that import failed
-        except Exception as e:
-            logger.error(f"[Tokenizer] Failed to initialize tiktoken: {e}")
-            _encoding = False
+            return None
+
+        cache_dir = _prepare_tiktoken_cache()
+        if cache_dir:
+            logger.debug(f"[Tokenizer] Using tiktoken cache dir: {cache_dir}")
+
+        _encoding = False
+        for attempt in range(1, TOKENIZER_LOAD_ATTEMPTS + 1):
+            try:
+                _encoding = tiktoken.get_encoding("cl100k_base")
+                logger.debug(
+                    f"[Tokenizer] Initialized tiktoken with cl100k_base encoding "
+                    f"(attempt {attempt}/{TOKENIZER_LOAD_ATTEMPTS})"
+                )
+                break
+            except Exception as e:
+                if attempt < TOKENIZER_LOAD_ATTEMPTS:
+                    delay = TOKENIZER_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"[Tokenizer] Failed to load cl100k_base "
+                        f"(attempt {attempt}/{TOKENIZER_LOAD_ATTEMPTS}): {e}. "
+                        f"Retrying in {delay:.1f}s"
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error(
+                        f"[Tokenizer] Failed to initialize tiktoken after "
+                        f"{TOKENIZER_LOAD_ATTEMPTS} attempts: {e}. "
+                        "Falling back to approximate token counting."
+                    )
     return _encoding if _encoding else None
+
+
+def approximate_token_count(text: str) -> int:
+    """
+    Approximate token count used when the real encoder is unavailable.
+
+    Rough estimate of ~4 characters per token for English (~2-3 for other languages).
+
+    Args:
+        text: Text to estimate
+
+    Returns:
+        Approximate token count without Claude correction applied
+    """
+    if not text:
+        return 0
+    return len(text) // FALLBACK_CHARS_PER_TOKEN + 1
 
 
 def count_tokens(text: str, apply_claude_correction: bool = True) -> int:
@@ -98,10 +198,8 @@ def count_tokens(text: str, apply_claude_correction: bool = True) -> int:
         except Exception as e:
             logger.warning(f"[Tokenizer] Error encoding text: {e}")
     
-    # Fallback: rough estimate ~4 characters per token for English,
-    # ~2-3 characters for other languages (taking average ~3.5)
-    # For Claude we add correction
-    base_estimate = len(text) // 4 + 1
+    # Fallback: approximate character-based estimate (never raises)
+    base_estimate = approximate_token_count(text)
     if apply_claude_correction:
         return int(base_estimate * CLAUDE_CORRECTION_FACTOR)
     return base_estimate

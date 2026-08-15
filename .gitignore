@@ -31,3 +31,7 @@ requests/
 .pytest_cache/
 .coverage
 htmlcov/
+
+
+# Local tiktoken encoding cache (offline token counting)
+.tiktoken_cache/

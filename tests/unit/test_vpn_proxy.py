@@ -308,3 +308,100 @@ def test_empty_vpn_proxy_url_does_not_set_variables(monkeypatch):
 
 
 print("VPN/Proxy tests loaded. Will verify proxy setup logic!")
+
+
+
+# ==================================================================================================
+# FIX-08: explicit proxy config must win over ambient lowercase proxy env vars
+# ==================================================================================================
+
+from kiro.config import (  # noqa: E402
+    apply_proxy_environment,
+    normalize_proxy_url,
+    LOWERCASE_PROXY_ENV_VARS,
+    UPPERCASE_PROXY_ENV_VARS,
+)
+
+_ALL_PROXY_ENV_KEYS = (
+    list(UPPERCASE_PROXY_ENV_VARS)
+    + list(LOWERCASE_PROXY_ENV_VARS)
+    + ["NO_PROXY", "no_proxy"]
+)
+
+
+def _clear_proxy_env(monkeypatch):
+    """Remove every proxy env var via monkeypatch so nothing leaks into other tests."""
+    for key in _ALL_PROXY_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_explicit_proxy_overrides_ambient_lowercase_vars(monkeypatch):
+    """
+    What it does: sets ambient lowercase http_proxy/https_proxy, then applies an explicit proxy.
+    Purpose: getproxies() must never be able to pick the ambient value over explicit config.
+    """
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("http_proxy", "http://ambient.example.com:3128")
+    monkeypatch.setenv("https_proxy", "http://ambient.example.com:3128")
+
+    applied = apply_proxy_environment("http://192.168.1.103:2080")
+
+    assert applied == "http://192.168.1.103:2080"
+    for key in list(UPPERCASE_PROXY_ENV_VARS) + list(LOWERCASE_PROXY_ENV_VARS):
+        assert os.environ[key] == "http://192.168.1.103:2080", f"{key} not overridden!"
+    assert "ambient.example.com" not in os.environ["http_proxy"]
+
+
+def test_explicit_proxy_normalizes_scheme_and_sets_no_proxy(monkeypatch):
+    """
+    What it does: applies a scheme-less proxy and checks normalization plus NO_PROXY handling.
+    Purpose: keep existing behaviour (http:// default, localhost excluded) intact.
+    """
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("NO_PROXY", "internal.corp")
+
+    applied = apply_proxy_environment("192.168.1.103:2080")
+
+    assert applied == "http://192.168.1.103:2080"
+    assert os.environ["NO_PROXY"] == "internal.corp,127.0.0.1,localhost"
+    assert os.environ["no_proxy"] == "internal.corp,127.0.0.1,localhost"
+
+
+def test_ambient_proxy_honoured_when_no_explicit_proxy(monkeypatch):
+    """
+    What it does: applies empty/None proxy config with ambient lowercase vars present.
+    Purpose: CRITICAL - users relying on ambient proxy settings must not be broken.
+    """
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("http_proxy", "http://ambient.example.com:3128")
+    monkeypatch.setenv("https_proxy", "http://ambient.example.com:3128")
+
+    assert apply_proxy_environment("") is None
+
+    # Ambient values untouched, and nothing new was invented.
+    assert os.environ["http_proxy"] == "http://ambient.example.com:3128"
+    assert os.environ["https_proxy"] == "http://ambient.example.com:3128"
+    assert os.environ.get("HTTP_PROXY") is None
+    assert os.environ.get("HTTPS_PROXY") is None
+    assert os.environ.get("ALL_PROXY") is None
+    assert os.environ.get("NO_PROXY") is None
+
+
+def test_apply_proxy_environment_does_not_touch_supplied_mapping_when_empty():
+    """
+    What it does: passes an isolated mapping with no explicit proxy configured.
+    Purpose: prove the "hands off" contract without mutating the real environment.
+    """
+    env = {"http_proxy": "http://ambient:3128"}
+    assert apply_proxy_environment("", env=env) is None
+    assert env == {"http_proxy": "http://ambient:3128"}
+
+
+def test_normalize_proxy_url_helper():
+    """
+    What it does: checks normalize_proxy_url for scheme-less, schemed and empty inputs.
+    Purpose: single source of truth for proxy URL normalization.
+    """
+    assert normalize_proxy_url("192.168.1.1:8080") == "http://192.168.1.1:8080"
+    assert normalize_proxy_url("socks5://127.0.0.1:1080") == "socks5://127.0.0.1:1080"
+    assert normalize_proxy_url("") == ""

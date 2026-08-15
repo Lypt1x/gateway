@@ -26,6 +26,7 @@ Loads environment variables and provides typed access to them.
 
 import os
 import re
+import secrets
 from pathlib import Path
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
@@ -95,8 +96,101 @@ SERVER_PORT: int = int(os.getenv("SERVER_PORT", str(DEFAULT_SERVER_PORT)))
 # Proxy Server Settings
 # ==================================================================================================
 
-# API key for proxy access (clients must pass it in Authorization header)
+# API key for proxy access (clients must pass it in Authorization header).
+#
+# Accepts EITHER a single key (historical behaviour) OR a comma-separated list of keys.
+# A request authenticates if it matches ANY configured key. See upstream issue #236:
+#   PROXY_API_KEY="primary-key,secondary-key-for-another-app"
+#
+# Multiple keys allow rotation without downtime, per-client revocation, and working around
+# clients that URL-encode special characters.
 PROXY_API_KEY: str = os.getenv("PROXY_API_KEY", "my-super-secret-password-123")
+
+
+def parse_proxy_api_keys(raw: Optional[str]) -> List[str]:
+    """
+    Parse the PROXY_API_KEY value into a list of accepted keys.
+
+    Splits on commas, strips surrounding whitespace, and drops empty entries so that
+    trailing commas or ``"a, ,b"`` do not create an empty (always-matching) key.
+    A value without commas yields a single-element list (backward compatible).
+
+    Args:
+        raw: Raw configuration value.
+
+    Returns:
+        List of non-empty keys, order preserved, duplicates removed.
+    """
+    if not raw:
+        return []
+    keys: List[str] = []
+    for part in raw.split(","):
+        key = part.strip()
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+# Parsed once at import time. Never log the contents of this list — only its length.
+PROXY_API_KEYS: List[str] = parse_proxy_api_keys(PROXY_API_KEY)
+
+
+def configured_proxy_api_key_count() -> int:
+    """Return how many keys are configured (safe to log; values are never logged)."""
+    return len(PROXY_API_KEYS)
+
+
+def verify_proxy_api_key(candidate: Optional[str], keys: Optional[List[str]] = None) -> bool:
+    """
+    Check a client-supplied key against the configured keys in constant time.
+
+    Uses :func:`secrets.compare_digest` instead of ``==``/``in`` so that a wrong key
+    cannot be recovered byte-by-byte through response-timing measurements. Every
+    configured key is compared (no early exit), so the work done does not reveal
+    *which* key position matched either.
+
+    Args:
+        candidate: Key presented by the client (may be None/empty).
+        keys: Keys to accept. Defaults to the configured ``PROXY_API_KEYS``.
+
+    Returns:
+        True if the candidate matches any configured key, False otherwise.
+    """
+    if not candidate:
+        return False
+
+    accepted = PROXY_API_KEYS if keys is None else keys
+    matched = False
+    for key in accepted:
+        if not key:
+            continue
+        try:
+            if secrets.compare_digest(candidate, key):
+                matched = True
+        except TypeError:
+            # compare_digest rejects non-ASCII str; fall back to a byte comparison.
+            if secrets.compare_digest(candidate.encode("utf-8"), key.encode("utf-8")):
+                matched = True
+    return matched
+
+
+def verify_proxy_bearer_token(
+    auth_header: Optional[str],
+    keys: Optional[List[str]] = None,
+) -> bool:
+    """
+    Validate an ``Authorization: Bearer <key>`` header against the configured keys.
+
+    Args:
+        auth_header: Raw Authorization header value.
+        keys: Keys to accept. Defaults to the configured ``PROXY_API_KEYS``.
+
+    Returns:
+        True if the header carries a valid bearer key.
+    """
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return False
+    return verify_proxy_api_key(auth_header[len("Bearer "):], keys=keys)
 
 # ==================================================================================================
 # VPN/Proxy Settings for Kiro API Access
@@ -119,6 +213,91 @@ PROXY_API_KEY: str = os.getenv("PROXY_API_KEY", "my-super-secret-password-123")
 #   VPN_PROXY_URL=http://user:password@proxy.company.com:8080
 #   VPN_PROXY_URL=192.168.1.100:8080  (defaults to http://)
 VPN_PROXY_URL: str = os.getenv("VPN_PROXY_URL", "")
+
+# Lowercase proxy environment variables. `urllib.request.getproxies()` (used by httpx,
+# requests, botocore and others) reads BOTH cases, and on POSIX the lowercase form wins for
+# `http_proxy`. If an ambient lowercase variable is left in place while the gateway is
+# configured with an explicit VPN_PROXY_URL, upstream traffic can be silently routed
+# somewhere other than the configured proxy.
+LOWERCASE_PROXY_ENV_VARS: tuple = ("http_proxy", "https_proxy", "all_proxy")
+UPPERCASE_PROXY_ENV_VARS: tuple = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
+
+# Hosts that must never be routed through the proxy.
+PROXY_LOCAL_HOSTS: str = "127.0.0.1,localhost"
+
+
+def normalize_proxy_url(proxy_url: str) -> str:
+    """
+    Normalize a proxy URL by adding the default http:// scheme when none is given.
+
+    Args:
+        proxy_url: Raw proxy URL (e.g. "192.168.1.100:8080" or "socks5://host:1080")
+
+    Returns:
+        Proxy URL with an explicit scheme. Empty input is returned unchanged.
+    """
+    if not proxy_url:
+        return proxy_url
+    return proxy_url if "://" in proxy_url else f"http://{proxy_url}"
+
+
+def apply_proxy_environment(
+    proxy_url: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    """
+    Apply explicit proxy configuration to the process environment, deterministically.
+
+    Precedence rules (deliberately conservative):
+
+    1. No explicit proxy configured -> the environment is NOT touched at all. Ambient
+       ``http_proxy`` / ``https_proxy`` settings keep working exactly as before, because
+       users legitimately rely on them.
+    2. Explicit proxy configured -> the normalized URL is written to both the uppercase
+       and the lowercase variants, so ``getproxies()`` cannot pick an ambient value that
+       disagrees with the configured routing. ``NO_PROXY``/``no_proxy`` gain the local
+       hosts (existing entries are preserved).
+
+    Args:
+        proxy_url: Explicit proxy URL. Defaults to the configured ``VPN_PROXY_URL``.
+        env: Environment mapping to mutate. Defaults to ``os.environ``.
+
+    Returns:
+        The normalized proxy URL that was applied, or None if nothing was configured
+        (in which case the environment was left untouched).
+    """
+    if proxy_url is None:
+        proxy_url = VPN_PROXY_URL
+    if env is None:
+        env = os.environ
+
+    # Rule 1: no explicit proxy -> hands off. Ambient proxy settings remain authoritative.
+    if not proxy_url:
+        return None
+
+    from loguru import logger
+
+    normalized = normalize_proxy_url(proxy_url)
+
+    # Rule 2: explicit proxy wins over anything ambient, in either case spelling.
+    for var in UPPERCASE_PROXY_ENV_VARS + LOWERCASE_PROXY_ENV_VARS:
+        previous = env.get(var)
+        if previous and previous != normalized:
+            logger.warning(
+                f"Ambient {var} ('{previous}') overridden by explicit VPN_PROXY_URL"
+            )
+        env[var] = normalized
+
+    # Preserve any existing NO_PROXY entries (either case) and always exclude local hosts.
+    existing_no_proxy = env.get("NO_PROXY") or env.get("no_proxy") or ""
+    if existing_no_proxy:
+        no_proxy_value = f"{existing_no_proxy},{PROXY_LOCAL_HOSTS}"
+    else:
+        no_proxy_value = PROXY_LOCAL_HOSTS
+    env["NO_PROXY"] = no_proxy_value
+    env["no_proxy"] = no_proxy_value
+
+    return normalized
 
 # ==================================================================================================
 # Kiro API Credentials
@@ -278,10 +457,12 @@ FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "claude-sonnet-4"},
     {"modelId": "claude-sonnet-4.5"},
     {"modelId": "claude-sonnet-4.6"},
+    {"modelId": "claude-sonnet-5"},
     {"modelId": "claude-haiku-4.5"},
     {"modelId": "claude-opus-4.5"},
     {"modelId": "claude-opus-4.6"},
     {"modelId": "claude-opus-4.7"},
+    {"modelId": "claude-opus-4.8"},
     {"modelId": "deepseek-3.2"},
     {"modelId": "glm-5"},
     {"modelId": "minimax-m2.1"},

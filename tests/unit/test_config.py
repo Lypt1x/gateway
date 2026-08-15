@@ -969,3 +969,65 @@ class TestAccountSystemConfig:
         
         print(f"Comparing STATE_SAVE_INTERVAL_SECONDS: Expected 10, Got {config_module.STATE_SAVE_INTERVAL_SECONDS}")
         assert config_module.STATE_SAVE_INTERVAL_SECONDS == 10
+
+
+
+class TestFallbackModelCatalog:
+    """Tests for the static FALLBACK_MODELS catalog (FIX-05)."""
+
+    NEW_MODEL_IDS = ["claude-opus-4.8", "claude-sonnet-5"]
+
+    def test_new_model_ids_present_in_fallback_models(self):
+        """
+        What it does: Verifies claude-opus-4.8 and claude-sonnet-5 are in FALLBACK_MODELS.
+        Purpose: These IDs are served by live upstream and must be discoverable via /v1/models.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        ids = [entry["modelId"] for entry in FALLBACK_MODELS]
+        for model_id in self.NEW_MODEL_IDS:
+            assert model_id in ids, f"{model_id} missing from FALLBACK_MODELS"
+
+    def test_new_model_ids_present_in_valid_runtime_model_ids(self):
+        """
+        What it does: Verifies the additions are re-exported as VALID_RUNTIME_MODEL_IDS.
+        Purpose: Runtime endpoints validate against this re-export.
+        """
+        from kiro.model_resolver import VALID_RUNTIME_MODEL_IDS
+
+        for model_id in self.NEW_MODEL_IDS:
+            assert model_id in VALID_RUNTIME_MODEL_IDS, (
+                f"{model_id} missing from VALID_RUNTIME_MODEL_IDS"
+            )
+
+    def test_entry_shape_matches_siblings(self):
+        """
+        What it does: Verifies every FALLBACK_MODELS entry is a dict with only 'modelId'.
+        Purpose: New entries must match the existing entry shape exactly.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        for entry in FALLBACK_MODELS:
+            assert isinstance(entry, dict)
+            assert set(entry.keys()) == {"modelId"}
+            assert isinstance(entry["modelId"], str)
+            assert entry["modelId"]
+
+    def test_fallback_model_ids_are_unique(self):
+        """
+        What it does: Verifies there are no duplicate model IDs.
+        Purpose: Duplicates would produce repeated entries in /v1/models.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        ids = [entry["modelId"] for entry in FALLBACK_MODELS]
+        assert len(ids) == len(set(ids))
+
+    def test_hidden_from_list_hides_only_auto(self):
+        """
+        What it does: Verifies HIDDEN_FROM_LIST still contains only 'auto'.
+        Purpose: The new models must remain visible in /v1/models.
+        """
+        from kiro.config import HIDDEN_FROM_LIST
+
+        assert HIDDEN_FROM_LIST == ["auto"]
