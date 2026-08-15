@@ -262,19 +262,40 @@ async def get_models(request: Request):
     available_model_ids, metadata_for = collect_visible_models(request)
     
     # Build OpenAI-compatible model list
-    openai_models = [
-        {
+    openai_models = []
+    for model_id in available_model_ids:
+        metadata = metadata_for(model_id)
+        entry = {
             **OpenAIModel(
                 id=model_id,
                 owned_by="anthropic",
                 description="Claude model via Kiro API"
             ).model_dump(),
-            **metadata_for(model_id),
+            **metadata,
         }
-        for model_id in available_model_ids
-    ]
+        entry.update(context_window_field(metadata))
+        openai_models.append(entry)
     
     return {"object": "list", "data": openai_models}
+
+
+def context_window_field(metadata: dict) -> dict:
+    """
+    Project upstream metadata into Grok Build's `context_window` spelling.
+
+    Grok Build's model prefetch reads a per-model `context_window` from /v1/models and
+    otherwise falls back to a hardcoded 200k default, which would make its auto-compaction
+    fire at the wrong point. The number is the same measurement already published as
+    `max_input_tokens` / `context_length`; only the field name differs, so this is a pure
+    additive alias, never a new source of truth.
+
+    Returns {} when the upstream catalog reports no input limit, so an unknown value is
+    omitted rather than fabricated (same discipline as get_public_metadata()).
+    """
+    max_input = (metadata or {}).get("max_input_tokens")
+    if isinstance(max_input, int) and not isinstance(max_input, bool):
+        return {"context_window": max_input}
+    return {}
 
 
 # OpenCode does not auto-discover models for custom providers (upstream OpenCode issue
@@ -423,6 +444,216 @@ async def get_opencode_config(
         content=json.dumps(config, indent=2, ensure_ascii=False) + "\n",
         media_type="application/json",
     )
+
+
+# --------------------------------------------------------------------------------------
+# Grok Build integration (see issue-plans/fix-grok-build-integration.md)
+# --------------------------------------------------------------------------------------
+
+# Grok Build resolves credentials from env vars named by `env_key`; there is no
+# {file:...}/{env:...} interpolation, so only the NAME of a variable is ever emitted.
+GROK_ENV_KEY_DEFAULT = "KIRO_GATEWAY_KEY"
+# "chat_completions" targets /v1/chat/completions, which this gateway serves. It is also
+# Grok's own default; it is emitted explicitly so the document is self-describing.
+GROK_API_BACKEND = "chat_completions"
+
+
+def _toml_string(value: str) -> str:
+    """Render a Python string as a TOML basic string (minimal required escaping)."""
+    escaped = (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+    return f'"{escaped}"'
+
+
+def _toml_key(key: str) -> str:
+    """
+    Render a table-path segment, quoting it unless it is unambiguously a bare key.
+
+    Model ids contain dots ("claude-sonnet-4.5"), and an unquoted dot in TOML is a table
+    separator — [model.claude-sonnet-4.5] would define model.claude-sonnet-4."5". Quoting
+    is therefore not cosmetic; it is what makes the document mean what it says.
+    """
+    if key and all(c.isalnum() or c in "-_" for c in key) and key.isascii():
+        return key
+    return _toml_string(key)
+
+
+# Grok's [models] table accepts exactly these keys (recovered from the binary's interned
+# key list): default, web_search, image_description, session_summary. Any role left unset
+# falls back to Grok's built-in xAI model, so all of them are pinned to visible models.
+GROK_IMAGE_INPUT_TYPE = "IMAGE"
+
+
+def _grok_cheapest_model(ids, metadata_for) -> str:
+    """
+    Pick the cheapest visible model for throwaway work (session titles).
+
+    Ordering is (rate_multiplier, model_id) so ties resolve by sorted id and the result
+    is fully deterministic. When upstream reports no rate metadata for any visible model
+    the choice degrades to the default model rather than to a guess.
+    """
+    priced = []
+    for model_id in ids:
+        rate = (metadata_for(model_id) or {}).get("rate_multiplier")
+        if isinstance(rate, (int, float)) and not isinstance(rate, bool):
+            priced.append((float(rate), model_id))
+    if not priced:
+        return ids[0]
+    return min(priced, key=lambda pair: (pair[0], pair[1]))[1]
+
+
+def _grok_image_model(ids, metadata_for):
+    """
+    Pick a visible model that upstream says accepts image input, else None.
+
+    Returning None means the key is omitted: pointing image_description at a text-only
+    model would fail just as surely as letting it escape to xAI, only less obviously.
+    Preference order is the catalog order, so the default model wins when it qualifies.
+    """
+    for model_id in ids:
+        input_types = (metadata_for(model_id) or {}).get("supported_input_types")
+        if isinstance(input_types, list) and any(
+            isinstance(t, str) and t.strip().upper() == GROK_IMAGE_INPUT_TYPE
+            for t in input_types
+        ):
+            return model_id
+    return None
+
+
+def build_grok_build_config(
+    model_ids,
+    metadata_for,
+    base_url: str,
+    env_key: str,
+) -> str:
+    """
+    Build a Grok Build (`~/.grok/config.toml`) fragment for this account's catalog.
+
+    Only keys documented by Grok Build 1.0.4 are emitted:
+
+        [endpoints] models_base_url   whole-catalog redirect; Grok fetches
+                                      {base_url}/models and sends inference to the same
+                                      base. Setting it also switches Grok to API-key auth
+                                      (Authorization: Bearer), so `grok login` is not
+                                      needed.
+        [models] default              which model the CLI starts on
+        [models] session_summary      cheapest visible model (titles are throwaway work)
+        [models] image_description     a visible image-capable model, omitted if none
+        [models] web_search           same as default
+        [model."<id>"]                per-model overrides: model, name, api_backend,
+                                      context_window, max_completion_tokens, env_key
+
+    `context_window` / `max_completion_tokens` are emitted ONLY when the upstream catalog
+    reports them; an unknown limit yields no key rather than a guess (Grok would otherwise
+    assume 200k, but a wrong explicit number is worse than its documented default).
+
+    `stream_tool_calls` is deliberately NOT emitted: per Grok's own docs it changes request
+    shape rather than just sampling, and some BYOK endpoints expect it unset.
+
+    Args:
+        model_ids: Visible model ids (already hidden-model filtered)
+        metadata_for: Callable(model_id) -> upstream metadata dict
+        base_url: Value for endpoints.models_base_url (should end in /v1)
+        env_key: NAME of the environment variable holding the gateway key — never a value
+
+    Returns:
+        A pretty-printed TOML document as text
+    """
+    lines = [
+        "# Kiro Gateway -> Grok Build config, generated by GET /integrations/grok-build.toml",
+        "# Merge these sections into ~/.grok/config.toml (see grok-build/grok_build_config.py).",
+        f"# The gateway key is read from the ${env_key} environment variable; no secret is stored here.",
+        "",
+        "[endpoints]",
+        f"models_base_url = {_toml_string(base_url)}",
+        "",
+    ]
+
+    ids = list(model_ids)
+    if ids:
+        default_id = ids[0]
+        lines.append("[models]")
+        lines.append(f"default = {_toml_string(default_id)}")
+        # Every auxiliary role must be pinned too. Left unset, Grok Build resolves them
+        # against its OWN built-in xAI model (observed: aux_model=grok-4.6), which this
+        # gateway rejects with INVALID_MODEL_ID — one failing request per session, and
+        # session titles silently degraded to truncated user text.
+        lines.append(f"session_summary = {_toml_string(_grok_cheapest_model(ids, metadata_for))}")
+        image_model = _grok_image_model(ids, metadata_for)
+        if image_model is not None:
+            lines.append(f"image_description = {_toml_string(image_model)}")
+        # web_search rides the default model. supports_backend_search is deliberately NOT
+        # emitted: we have not verified this gateway satisfies Grok's backend-search
+        # contract, and advertising an untested capability would be a lie.
+        lines.append(f"web_search = {_toml_string(default_id)}")
+        lines.append("")
+
+    for model_id in ids:
+        metadata = metadata_for(model_id) or {}
+        lines.append(f"[model.{_toml_key(model_id)}]")
+        lines.append(f"model = {_toml_string(model_id)}")
+        display_name = metadata.get("display_name") or model_id
+        lines.append(f"name = {_toml_string(display_name)}")
+        lines.append(f"api_backend = {_toml_string(GROK_API_BACKEND)}")
+
+        context_window = context_window_field(metadata).get("context_window")
+        if context_window is not None:
+            lines.append(f"context_window = {context_window}")
+
+        max_output = metadata.get("max_output_tokens")
+        if isinstance(max_output, int) and not isinstance(max_output, bool):
+            lines.append(f"max_completion_tokens = {max_output}")
+
+        lines.append(f"env_key = {_toml_string(env_key)}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+@router.get("/integrations/grok-build.toml", dependencies=[Depends(verify_api_key)])
+async def get_grok_build_config(
+    request: Request,
+    base_url: str = None,
+    env_key: str = None,
+):
+    """
+    Return a ready-to-paste Grok Build config for THIS account's model catalog.
+
+    Same rationale as /integrations/opencode.json: /ListAvailableModels is authenticated
+    and per-account, so a checked-in file would misrepresent entitlements. The model set
+    comes from collect_visible_models(), the identical helper /v1/models uses, so the two
+    integration endpoints and the catalog can never disagree.
+
+    Nothing is written to disk here, and no secret is emitted: only the NAME of an
+    environment variable (default KIRO_GATEWAY_KEY). The server's configured
+    PROXY_API_KEY is never read by this handler.
+
+    Args:
+        request: FastAPI Request (also used to derive models_base_url)
+        base_url: Override for endpoints.models_base_url (default: derived from request)
+        env_key: Name of the env var Grok should read the gateway key from
+
+    Returns:
+        A TOML document (application/toml), pretty-printed for pasting
+    """
+    logger.info("Request to /integrations/grok-build.toml")
+
+    model_ids, metadata_for = collect_visible_models(request)
+
+    document = build_grok_build_config(
+        model_ids=model_ids,
+        metadata_for=metadata_for,
+        base_url=base_url or _derive_base_url(request),
+        env_key=env_key or GROK_ENV_KEY_DEFAULT,
+    )
+
+    return Response(content=document, media_type="application/toml; charset=utf-8")
 
 
 @router.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
