@@ -355,22 +355,22 @@ class AwsEventStreamParser:
         
         # input can be string or object
         input_data = data.get('input', '')
+        # Discriminated accumulator: a non-empty dict fragment starts dict mode so that
+        # later dict fragments can be merged instead of string-concatenated (invalid JSON).
+        # String fragments (the common partial-JSON streaming case) stay in string mode.
+        args: Any
         if isinstance(input_data, dict):
-            if input_data:
-                # Non-empty dict: serialize it
-                input_str = json.dumps(input_data)
-            else:
-                # Empty dict {}: fragments will follow, use empty string
-                input_str = ''
+            # Empty dict {}: fragments will follow, start in string mode with ''
+            args = dict(input_data) if input_data else ''
         else:
-            input_str = str(input_data) if input_data else ''
+            args = str(input_data) if input_data else ''
         
         self.current_tool_call = {
             "id": data.get('toolUseId', generate_tool_call_id()),
             "type": "function",
             "function": {
                 "name": data.get('name', ''),
-                "arguments": input_str
+                "arguments": args
             }
         }
         
@@ -384,14 +384,30 @@ class AwsEventStreamParser:
         if self.current_tool_call:
             # input can be string or object
             input_data = data.get('input', '')
+            fn = self.current_tool_call['function']
+            current = fn['arguments']
+            
             if isinstance(input_data, dict):
-                if input_data:
-                    input_str = json.dumps(input_data)
+                if not input_data:
+                    return None
+                if isinstance(current, dict):
+                    # Dict mode: merge fragments, later keys win
+                    current.update(input_data)
+                elif isinstance(current, str) and not current:
+                    # Nothing accumulated yet: enter dict mode
+                    fn['arguments'] = dict(input_data)
                 else:
-                    input_str = ''
+                    # Mixed shapes: prefer the string path (previous behaviour)
+                    fn['arguments'] = current + json.dumps(input_data)
             else:
                 input_str = str(input_data) if input_data else ''
-            self.current_tool_call['function']['arguments'] += input_str
+                if not input_str:
+                    return None
+                if isinstance(current, dict):
+                    # Mixed shapes: fall back to string concatenation as before
+                    fn['arguments'] = json.dumps(current) + input_str
+                else:
+                    fn['arguments'] = current + input_str
         return None
     
     def _process_tool_stop_event(self, data: dict) -> Optional[Dict[str, Any]]:

@@ -5,6 +5,8 @@ Unit tests for AwsEventStreamParser and auxiliary parsing functions.
 Tests the parsing logic for AWS SSE stream from Kiro API.
 """
 
+import json
+
 import pytest
 
 from kiro.parsers import (
@@ -1357,3 +1359,71 @@ class TestTruncationRecoveryIntegration:
         
         print("Checking: Third tool call NOT marked as truncated...")
         assert aws_event_parser.tool_calls[2].get("_truncation_detected") is not True
+
+
+
+class TestToolInputAccumulator:
+    """FIX-03: dict input fragments must merge, string fragments must concatenate."""
+
+    def _parser(self):
+        return AwsEventStreamParser()
+
+    def _start(self, parser, input_data):
+        parser._process_tool_start_event({
+            "toolUseId": "tool-1", "name": "demo", "input": input_data
+        })
+
+    def test_two_dict_fragments_merge(self):
+        """Two non-empty dict fragments merge instead of producing invalid JSON."""
+        p = self._parser()
+        self._start(p, {})
+        p._process_tool_input_event({"input": {"a": 1}})
+        p._process_tool_input_event({"input": {"b": 2}})
+        p._finalize_tool_call()
+        args = json.loads(p.tool_calls[0]["function"]["arguments"])
+        assert args == {"a": 1, "b": 2}
+
+    def test_dict_start_then_dict_fragment_merges(self):
+        """A non-empty dict on start merges with a following dict fragment."""
+        p = self._parser()
+        self._start(p, {"a": 1})
+        p._process_tool_input_event({"input": {"b": 2}})
+        p._finalize_tool_call()
+        assert json.loads(p.tool_calls[0]["function"]["arguments"]) == {"a": 1, "b": 2}
+
+    def test_overlapping_keys_later_wins(self):
+        p = self._parser()
+        self._start(p, {"a": 1})
+        p._process_tool_input_event({"input": {"a": 2, "b": 3}})
+        p._finalize_tool_call()
+        assert json.loads(p.tool_calls[0]["function"]["arguments"]) == {"a": 2, "b": 3}
+
+    def test_single_dict_fragment_unchanged(self):
+        p = self._parser()
+        self._start(p, {"path": "/tmp/x"})
+        p._finalize_tool_call()
+        assert json.loads(p.tool_calls[0]["function"]["arguments"]) == {"path": "/tmp/x"}
+
+    def test_string_fragments_still_concatenate(self):
+        """Critical regression guard: partial-JSON string streaming is the common path."""
+        p = self._parser()
+        self._start(p, '{"a":')
+        p._process_tool_input_event({"input": ' 1, "b"'})
+        p._process_tool_input_event({"input": ': "two"}'})
+        p._finalize_tool_call()
+        assert json.loads(p.tool_calls[0]["function"]["arguments"]) == {"a": 1, "b": "two"}
+
+    def test_empty_dict_start_then_string_fragments(self):
+        p = self._parser()
+        self._start(p, {})
+        p._process_tool_input_event({"input": '{"a": 1}'})
+        p._finalize_tool_call()
+        assert json.loads(p.tool_calls[0]["function"]["arguments"]) == {"a": 1}
+
+    def test_truncated_string_json_still_detected(self):
+        p = self._parser()
+        self._start(p, '{"a": "' + "x" * 100)
+        p._finalize_tool_call()
+        call = p.tool_calls[0]
+        assert call.get("_truncation_detected") is True
+        assert call["function"]["arguments"] == "{}"
