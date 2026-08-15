@@ -47,23 +47,64 @@ upstream fault.
 
 ## 3. Event-stream decoder coverage
 
-The decoder is on by default and confirmed to take the `framed` path in production, but only
-against Claude models on the happy path plus one tool call.
+The decoder is on by default and confirmed to take the `framed` path in production.
 
-- [ ] Non-Claude families under the decoder: `gpt-5.6-sol` / `-terra` / `-luna`, `deepseek-3.2`,
-      `glm-5`, `minimax-*`, `qwen3-coder-next` — these emit reasoning differently
-- [ ] `claude-opus-5` streaming and tool calls
-- [ ] Parallel/multiple tool calls in one stream (only sequential `toolUseId` handling is tested)
+- [x] Non-Claude families under the decoder: verified `gpt-5.6-terra`, `qwen3-coder-next`,
+      `glm-5`, `claude-opus-5`, `auto-kiro` all answer correctly through OpenCode
+- [x] Tool calling on a non-Claude family (`gpt-5.6-terra` wrote a file via the tool loop)
+- [x] All six upstream event types mapped and documented
+      (`assistantResponseEvent`, `toolUseEvent`, `metadataEvent`, `contextUsageEvent`,
+      `meteringEvent`, `reasoningContentEvent`)
+- [ ] Parallel/multiple tool calls in one stream (only sequential `toolUseId` is tested)
 - [ ] Very large tool arguments spanning many frames
-- [ ] Legacy fallback path (`EVENTSTREAM_DECODER=false`) beyond the single A/B tool-call check
+- [ ] Legacy fallback path (`EVENTSTREAM_DECODER=false`) beyond the A/B checks
 - [ ] Mid-stream framing corruption triggering the live fallback
-- [ ] Whether dropping the legacy adjacent-duplicate content suppression changes any real output
+- [ ] Whether dropping the legacy adjacent-duplicate content suppression changes real output
+- [ ] Exception / throttle frames: still never observed live, so `:exception-type` handling
+      remains unproven against a real payload
 
 > [!WARNING]
-> The `toolUseEvent` regression is the cautionary tale here: unit tests passed while live tool
-> calls returned `7` and `{}`. Frame-shape assumptions need live confirmation, not just fixtures.
+> Two regressions in this area were found ONLY by live use, both with green unit tests.
+> The `toolUseEvent` routing bug returned `7` and `{}` instead of real arguments, and the
+> event-name mapping bug (`messageMetadata*` never existing on the wire) silently dropped
+> completion, context and credit events. Frame-shape assumptions must be confirmed against
+> captured traffic, not fixtures.
 
-## 4. Deployment and platform
+## 4. OpenCode integration
+
+Verified end to end on 2026-08-15 with OpenCode 1.18.18 (native Linux build) against the
+gateway: `GET /integrations/opencode.json` produced a config that registered all 19 models,
+plain completions worked, and the full agentic tool loop wrote files correctly on both
+`claude-sonnet-4.5` and `gpt-5.6-terra`.
+
+- [x] Generated config imports cleanly; `opencode models kiro` lists all 19
+- [x] Tool-calling loop works through the gateway
+- [ ] **`reasoning: true` does not work.** With `"reasoning": true` plus
+      `"interleaved": {"field": "reasoning_content"}`, OpenCode reports `"reasoning": 0` tokens
+      and emits no reasoning part, even though the gateway demonstrably sends
+      `reasoning_content` (41 SSE chunks in the same request). Harmless but ineffective, which
+      is why `?reasoning=` defaults to false. The correct AI SDK config for surfacing reasoning
+      through `@ai-sdk/openai-compatible` is still unknown.
+- [ ] Step 3: the setup / doctor / update wrapper. Now unblocked. `doctor` should diff a
+      user's existing config against the live catalog and report models they list but cannot
+      access, models they are missing, and stale limits. It must MERGE, never overwrite, since
+      users keep agents, plugins and MCP config in the same file.
+- [ ] Credit display (the reason the payload mapping was completed): `meteringEvent` carries
+      `{"unit":"credit","unitPlural":"credits","usage":<float>}` and is now retained as
+      `parser.last_metering`. Nothing consumes it yet. Exposing per-request credit spend would
+      pair well with the `rate_multiplier` already on `/v1/models`.
+- [ ] Attachment/vision capability is not expressed in the generated config. We know
+      `supported_input_types` per model, but no documented OpenCode field was found for it, so
+      nothing is emitted rather than inventing schema.
+- [ ] Verify against a free-tier Kiro account that the generated config contains only the
+      models that account can reach (the per-account rationale is sound but untested).
+
+> [!NOTE]
+> `opencode run` hangs indefinitely when stdin is not a TTY and not redirected. Use
+> `opencode run ... < /dev/null` in scripts and CI. This cost real debugging time and looked
+> like a gateway hang; it is not.
+
+## 5. Deployment and platform
 
 - [ ] Docker deployment end to end — never run in this session. The credential volume mounts in
       `docker-compose.yml` are commented out by default, so first-run UX is unverified
@@ -74,7 +115,7 @@ against Claude models on the happy path plus one tool call.
 - [ ] Multi-account pooling and failover — only ever run with a single account, so rotation,
       state persistence across restarts, and error-driven failover are untested
 
-## 5. Feature gaps and accuracy
+## 6. Feature gaps and accuracy
 
 - [ ] `#176` document blocks for textual media types (only a PDF was tested, which correctly
       degrades to a "cannot read" placeholder since Kiro has no document channel)
@@ -88,7 +129,7 @@ against Claude models on the happy path plus one tool call.
 - [ ] Client identity: two User-Agent version tokens (`ua/2.1` and the client crate version)
       could not be isolated in the binary and are inferred
 
-## 6. Known deliberate divergences from real kiro-cli
+## 7. Known deliberate divergences from real kiro-cli
 
 Not bugs. Recorded so they are not "fixed" by accident.
 
@@ -97,7 +138,7 @@ Not bugs. Recorded so they are not "fixed" by accident.
 - No mid-stream resume by default. The real client simply fails and surfaces the error, so
   matching it is correct rather than lazy.
 
-## 7. Housekeeping
+## 8. Housekeeping
 
 - [ ] The seven translated READMEs under `docs/` still describe the old README structure
 - [ ] `README.md` now diverges from upstream, so merges from `jwadow/kiro-gateway` will conflict
