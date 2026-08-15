@@ -37,6 +37,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -91,6 +92,133 @@ def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
         False
     """
     return "://runtime." in auth_manager.api_host
+
+
+# Maximum length of an upstream error body kept in a diagnostic reason
+MAX_ERROR_BODY_CHARS = 300
+
+# Credential fields that must never appear in logs or error messages
+_SECRET_FIELD_NAMES = (
+    "accessToken", "access_token",
+    "refreshToken", "refresh_token",
+    "idToken", "id_token",
+    "clientSecret", "client_secret",
+    "authorization", "Authorization",
+    "bearer", "Bearer",
+)
+
+# "accessToken": "abc"  /  access_token=abc  /  Authorization: Bearer abc
+_SECRET_PATTERN = re.compile(
+    r'(?P<key>["\']?(?:' + "|".join(_SECRET_FIELD_NAMES) + r')["\']?\s*[:=]\s*)'
+    r'(?P<quote>["\']?)(?P<value>[^"\'\s,;}&]+)(?P=quote)',
+    re.IGNORECASE,
+)
+
+# Authorization: Bearer <token>  /  Bearer <token>
+_BEARER_PATTERN = re.compile(
+    r'(?P<prefix>(?:Authorization\s*[:=]\s*)?Bearer\s+)\S+',
+    re.IGNORECASE,
+)
+
+
+def redact_secrets(text: str) -> str:
+    """
+    Remove credential values from a diagnostic string.
+    
+    Replaces the value of any known secret field (tokens, client secrets,
+    Authorization headers) with "[REDACTED]" so error reasons can be logged
+    safely.
+    
+    Args:
+        text: Arbitrary diagnostic text (exception message, response body)
+    
+    Returns:
+        Same text with secret values replaced
+    
+    Examples:
+        >>> redact_secrets('{"refresh_token": "s3cret"}')
+        '{"refresh_token": "[REDACTED]"}'
+        >>> redact_secrets('Authorization: Bearer abc123')
+        'Authorization: [REDACTED]'
+    """
+    if not text:
+        return ""
+    
+    def _replace(match: "re.Match") -> str:
+        quote = match.group("quote")
+        return f'{match.group("key")}{quote}[REDACTED]{quote}'
+    
+    # Two passes: "Authorization: Bearer abc" needs both the header name and
+    # the "Bearer" prefix handled.
+    text = _BEARER_PATTERN.sub(lambda m: f'{m.group("prefix")}[REDACTED]', text)
+    return _SECRET_PATTERN.sub(_replace, _SECRET_PATTERN.sub(_replace, text))
+
+
+def describe_init_failure(exc: BaseException) -> str:
+    """
+    Build a safe, human-readable reason string for an initialization failure.
+    
+    Includes the exception type and message, plus the upstream response body
+    for HTTP errors (truncated and with secrets redacted).
+    
+    Args:
+        exc: Exception raised while initializing an account
+    
+    Returns:
+        Reason string, e.g.
+        'HTTPStatusError: HTTP 400 from AWS SSO OIDC: {"error":"invalid_grant"}'
+    """
+    reason = f"{type(exc).__name__}: {exc}"
+    
+    # Attach the upstream body for HTTP errors (httpx.HTTPStatusError and
+    # anything else exposing a .response with .text)
+    response = getattr(exc, "response", None)
+    body = getattr(response, "text", None)
+    if isinstance(body, str) and body.strip():
+        status = getattr(response, "status_code", "?")
+        reason = f"{type(exc).__name__}: HTTP {status}: {body}"
+    
+    reason = redact_secrets(reason).replace("\n", " ").strip()
+    
+    if len(reason) > MAX_ERROR_BODY_CHARS:
+        reason = reason[:MAX_ERROR_BODY_CHARS] + "... (truncated)"
+    
+    return reason
+
+
+def is_invalid_grant(reason: Optional[str]) -> bool:
+    """
+    Check whether a failure reason is an OIDC invalid_grant (revoked/expired token).
+    
+    Args:
+        reason: Reason string from describe_init_failure()
+    
+    Returns:
+        True if the upstream rejected the refresh token itself
+    """
+    return bool(reason) and isinstance(reason, str) and "invalid_grant" in reason.lower()
+
+
+def format_init_failure_guidance(reason: Optional[str]) -> str:
+    """
+    Append actionable operator guidance to a failure reason.
+    
+    An invalid_grant means the stored refresh token was revoked upstream — the
+    only fix is re-authenticating, not editing configuration.
+    
+    Args:
+        reason: Reason string from describe_init_failure()
+    
+    Returns:
+        Reason with guidance appended when applicable
+    """
+    if is_invalid_grant(reason):
+        return (
+            f"{reason} — the stored refresh token is no longer accepted by AWS SSO OIDC "
+            f"and must be re-authenticated: log in again in Kiro IDE or kiro-cli, then "
+            f"restart the gateway. This is not a configuration error."
+        )
+    return reason if isinstance(reason, str) and reason else "unknown error"
 
 
 def _format_duration(seconds: float) -> str:
@@ -211,6 +339,21 @@ class AccountManager:
         self._dirty = False
         self._credentials_config: List[Dict] = []
         self._current_account_index: int = 0  # GLOBAL sticky index for all models
+        # Last initialization failure reason per account (diagnostics only,
+        # never contains credential values). See describe_init_failure().
+        self._init_errors: Dict[str, str] = {}
+    
+    def get_init_error(self, account_id: str) -> Optional[str]:
+        """
+        Get the reason the last initialization attempt for an account failed.
+        
+        Args:
+            account_id: Account ID
+        
+        Returns:
+            Redacted reason string, or None if the account never failed
+        """
+        return self._init_errors.get(account_id)
     
     async def load_credentials(self) -> None:
         """
@@ -440,9 +583,14 @@ class AccountManager:
         
         Returns:
             True if successful, False otherwise
+        
+        Note:
+            On failure the reason is recorded and available via
+            get_init_error(account_id) — the boolean contract is unchanged.
         """
         account = self._accounts.get(account_id)
         if not account:
+            self._init_errors[account_id] = "Unknown account (not present in credentials)"
             return False
         
         try:
@@ -465,6 +613,7 @@ class AccountManager:
             
             if not creds_config:
                 logger.error(f"No credentials config found for account: {account_id}")
+                self._init_errors[account_id] = "No matching entry in credentials.json"
                 return False
             
             # Create KiroAuthManager based on type
@@ -492,6 +641,7 @@ class AccountManager:
                 )
             else:
                 logger.error(f"Unknown credential type: {cred_type}")
+                self._init_errors[account_id] = f"Unknown credential type: {cred_type}"
                 return False
             
             # Get token to verify credentials
@@ -572,10 +722,13 @@ class AccountManager:
             
             logger.info(f"Initialized account: {account_id} ({len(available_models)} models)")
             self._dirty = True
+            self._init_errors.pop(account_id, None)
             return True
         
         except Exception as e:
-            logger.error(f"Failed to initialize account {account_id}: {e}")
+            reason = describe_init_failure(e)
+            self._init_errors[account_id] = reason
+            logger.error(f"Failed to initialize account {account_id}: {reason}")
             return False
     
     async def _refresh_account_models(self, account_id: str) -> None:

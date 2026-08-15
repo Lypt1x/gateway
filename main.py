@@ -75,6 +75,7 @@ from kiro.config import (
     HIDDEN_FROM_LIST,
     FALLBACK_MODELS,
     VPN_PROXY_URL,
+    apply_proxy_environment,
     ACCOUNT_SYSTEM,
     ACCOUNTS_CONFIG_FILE,
     ACCOUNTS_STATE_FILE,
@@ -83,7 +84,7 @@ from kiro.config import (
 from kiro.auth import KiroAuthManager
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
-from kiro.account_manager import AccountManager
+from kiro.account_manager import AccountManager, format_init_failure_guidance
 from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
 from kiro.exceptions import validation_exception_handler
@@ -184,24 +185,11 @@ setup_logging_intercept()
 # Must be set BEFORE creating any httpx clients (including in lifespan)
 # httpx automatically picks up HTTP_PROXY, HTTPS_PROXY, ALL_PROXY from environment
 
-if VPN_PROXY_URL:
-    # Normalize URL - add http:// if no scheme specified
-    proxy_url_with_scheme = VPN_PROXY_URL if "://" in VPN_PROXY_URL else f"http://{VPN_PROXY_URL}"
-    
-    # Set environment variables for httpx to pick up automatically
-    os.environ['HTTP_PROXY'] = proxy_url_with_scheme
-    os.environ['HTTPS_PROXY'] = proxy_url_with_scheme
-    os.environ['ALL_PROXY'] = proxy_url_with_scheme
-    
-    # Exclude localhost from proxy to avoid routing local requests through it
-    no_proxy_hosts = os.environ.get("NO_PROXY", "")
-    local_hosts = "127.0.0.1,localhost"
-    if no_proxy_hosts:
-        os.environ["NO_PROXY"] = f"{no_proxy_hosts},{local_hosts}"
-    else:
-        os.environ["NO_PROXY"] = local_hosts
-    
-    logger.info(f"Proxy configured: {proxy_url_with_scheme}")
+# Single normalization point: explicit config wins over ambient lowercase proxy vars,
+# and the environment is left untouched when no explicit proxy is configured.
+_applied_proxy_url = apply_proxy_environment(VPN_PROXY_URL)
+if _applied_proxy_url:
+    logger.info(f"Proxy configured: {_applied_proxy_url}")
     logger.debug(f"NO_PROXY: {os.environ['NO_PROXY']}")
 
 
@@ -479,6 +467,7 @@ async def lifespan(app: FastAPI):
     
     # Try to initialize accounts (full circle)
     initialized = False
+    failure_reasons = []
     
     for i in range(len(all_accounts)):
         current_index = (start_index + i) % len(all_accounts)
@@ -493,11 +482,16 @@ async def lifespan(app: FastAPI):
             initialized = True
             break
         else:
-            logger.warning(f"Failed to initialize account: {account_id}")
+            reason = format_init_failure_guidance(
+                app.state.account_manager.get_init_error(account_id)
+            )
+            failure_reasons.append(f"{account_id}: {reason}")
+            logger.warning(f"Failed to initialize account: {account_id} — {reason}")
     
     if not initialized:
-        logger.error("Failed to initialize any account. Check your credentials.")
-        raise RuntimeError("Failed to initialize any account")
+        details = "; ".join(failure_reasons) if failure_reasons else "no reason recorded"
+        logger.error(f"Failed to initialize any account. {details}")
+        raise RuntimeError(f"Failed to initialize any account. {details}")
     
     # Save initial state
     await app.state.account_manager._save_state()
