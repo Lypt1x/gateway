@@ -363,6 +363,18 @@ KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 # Host for Q API (ListAvailableModels)
 KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 
+# Host for the CONTROL-PLANE API (ListAvailableModels).
+#
+# Measured behaviour (see issue-plans/fix-dynamic-model-discovery.md):
+#   runtime.{region}.kiro.dev does NOT route ListAvailableModels — every variant,
+#   including the Coral target "CodeWhispererRuntime.ListAvailableModels", answers
+#   UnknownOperationException. The operation IS live on the control-plane host with
+#   the very same bearer token and headers:
+#     GET https://q.{region}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR -> 200
+#
+# Streaming/chat keeps using KIRO_API_HOST_TEMPLATE; only model LISTING uses this.
+KIRO_CONTROL_PLANE_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
+
 # ==================================================================================================
 # Token Settings
 # ==================================================================================================
@@ -463,6 +475,10 @@ FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "claude-opus-4.6"},
     {"modelId": "claude-opus-4.7"},
     {"modelId": "claude-opus-4.8"},
+    {"modelId": "claude-opus-5"},
+    {"modelId": "gpt-5.6-sol"},
+    {"modelId": "gpt-5.6-terra"},
+    {"modelId": "gpt-5.6-luna"},
     {"modelId": "deepseek-3.2"},
     {"modelId": "glm-5"},
     {"modelId": "minimax-m2.1"},
@@ -474,8 +490,23 @@ FALLBACK_MODELS: List[Dict[str, str]] = [
 # Model Cache Settings
 # ==================================================================================================
 
-# Model cache TTL in seconds (1 hour)
-MODEL_CACHE_TTL: int = 3600
+# Model cache TTL in seconds (default 1 hour).
+# Controls how long a fetched model catalog is reused before discovery re-runs.
+MODEL_CACHE_TTL: int = int(os.getenv("MODEL_CACHE_TTL", "3600"))
+
+# Enable dynamic model discovery (ListAvailableModels against the control-plane host).
+#
+# Default: TRUE — new upstream models then appear automatically, matching kiro-cli.
+# Set to false to force the static FALLBACK_MODELS list and make no discovery request
+# at all.
+MODEL_DISCOVERY: bool = os.getenv("MODEL_DISCOVERY", "true").lower() not in (
+    "false", "0", "no", "off", "disabled"
+)
+
+# Wall-clock budget for one discovery attempt (seconds).
+# Deliberately short: a control-plane outage must never delay or fail gateway startup.
+# On timeout the static FALLBACK_MODELS list is used.
+MODEL_DISCOVERY_TIMEOUT: float = float(os.getenv("MODEL_DISCOVERY_TIMEOUT", "8"))
 
 # Default maximum number of input tokens
 DEFAULT_MAX_INPUT_TOKENS: int = 200000
@@ -825,6 +856,16 @@ def get_aws_sso_oidc_url(region: str) -> str:
 def get_kiro_api_host(region: str) -> str:
     """Return API host for the specified region."""
     return KIRO_API_HOST_TEMPLATE.format(region=region)
+
+
+def get_kiro_control_plane_host(region: str) -> str:
+    """
+    Return the control-plane host that serves ListAvailableModels for a region.
+
+    This is intentionally separate from get_kiro_api_host(): chat/streaming stays on
+    the runtime host while model listing goes to the control plane.
+    """
+    return KIRO_CONTROL_PLANE_HOST_TEMPLATE.format(region=region)
 
 
 def get_kiro_q_host(region: str) -> str:

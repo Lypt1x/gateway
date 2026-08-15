@@ -62,20 +62,67 @@ class ModelInfoCache:
         self._last_update: Optional[float] = None
         self._cache_ttl = cache_ttl
     
+    # Richer per-model metadata returned by ListAvailableModels. Stored verbatim so a
+    # later change can expose it without another upstream round-trip.
+    METADATA_FIELDS = (
+        "modelName",
+        "description",
+        "tokenLimits",
+        "promptCaching",
+        "rateMultiplier",
+        "rateUnit",
+        "supportedInputTypes",
+        "availableOrigins",
+        "additionalModelRequestFieldsSchema",
+    )
+
     async def update(self, models_data: List[Dict[str, Any]]) -> None:
         """
         Updates the model cache.
         
         Thread-safely replaces cache contents with new data.
         
+        Entries that are not dicts or carry no non-empty "modelId" are skipped instead
+        of raising, so a malformed upstream body can never break discovery. Every other
+        field of an accepted entry is preserved verbatim (see METADATA_FIELDS).
+        
         Args:
             models_data: List of dictionaries with model information.
                         Each dictionary must contain the "modelId" key.
         """
         async with self._lock:
-            logger.info(f"Updating model cache. Found {len(models_data)} models.")
-            self._cache = {model["modelId"]: model for model in models_data}
+            normalized: Dict[str, Dict[str, Any]] = {}
+            skipped = 0
+            for model in models_data or []:
+                if not isinstance(model, dict):
+                    skipped += 1
+                    continue
+                model_id = model.get("modelId")
+                if not isinstance(model_id, str) or not model_id:
+                    skipped += 1
+                    continue
+                normalized[model_id] = model
+            if skipped:
+                logger.warning(f"Skipped {skipped} malformed model entrie(s) while updating cache.")
+            logger.info(f"Updating model cache. Found {len(normalized)} models.")
+            self._cache = normalized
             self._last_update = time.time()
+
+    def get_metadata(self, model_id: str, field: str) -> Optional[Any]:
+        """
+        Return one metadata field for a model, or None when absent.
+        
+        Args:
+            model_id: Model ID
+            field: Metadata key (e.g. "rateMultiplier", "promptCaching")
+        
+        Returns:
+            Field value or None
+        """
+        model = self._cache.get(model_id)
+        if not model:
+            return None
+        return model.get(field)
     
     def get(self, model_id: str) -> Optional[Dict[str, Any]]:
         """

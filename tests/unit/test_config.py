@@ -606,6 +606,79 @@ class TestFallbackModelsConfig:
                     pass
 
 
+class TestFallbackModelsCatalogSync:
+    """Tests that FALLBACK_MODELS matches the verified upstream catalog (19 models)."""
+
+    NEW_MODEL_IDS = [
+        "claude-opus-5",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ]
+
+    def test_new_models_present_in_fallback_models(self):
+        """
+        What it does: Verifies the four newly verified upstream models are in FALLBACK_MODELS.
+        Purpose: Keep the static catalog in sync with the live /ListAvailableModels response.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        model_ids = [m["modelId"] for m in FALLBACK_MODELS]
+        for model_id in self.NEW_MODEL_IDS:
+            assert model_id in model_ids, f"{model_id} missing from FALLBACK_MODELS"
+
+    def test_new_models_entry_shape_matches_siblings(self):
+        """
+        What it does: Verifies new entries are plain {"modelId": str} dicts like their siblings.
+        Purpose: Prevent shape drift that would break model_cache.update().
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        entries = [m for m in FALLBACK_MODELS if m["modelId"] in self.NEW_MODEL_IDS]
+        assert len(entries) == len(self.NEW_MODEL_IDS)
+        for entry in entries:
+            assert list(entry.keys()) == ["modelId"], f"Unexpected keys in {entry}"
+            assert isinstance(entry["modelId"], str)
+
+    def test_fallback_models_total_count_is_19(self):
+        """
+        What it does: Verifies the catalog holds exactly 19 entries.
+        Purpose: Match the measured upstream catalog size.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        assert len(FALLBACK_MODELS) == 19
+
+    def test_fallback_models_have_no_duplicates(self):
+        """
+        What it does: Verifies no model ID appears twice.
+        Purpose: Duplicates would surface repeated entries in /v1/models.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        model_ids = [m["modelId"] for m in FALLBACK_MODELS]
+        assert len(model_ids) == len(set(model_ids))
+
+    def test_new_models_are_valid_runtime_model_ids(self):
+        """
+        What it does: Verifies new models are accepted as valid runtime model IDs.
+        Purpose: VALID_RUNTIME_MODEL_IDS derives from FALLBACK_MODELS; confirm the link holds.
+        """
+        from kiro.model_resolver import VALID_RUNTIME_MODEL_IDS
+
+        for model_id in self.NEW_MODEL_IDS:
+            assert model_id in VALID_RUNTIME_MODEL_IDS
+
+    def test_hidden_from_list_unchanged(self):
+        """
+        What it does: Verifies HIDDEN_FROM_LIST still hides only "auto".
+        Purpose: This additive change must not alter list visibility.
+        """
+        from kiro.config import HIDDEN_FROM_LIST
+
+        assert HIDDEN_FROM_LIST == ["auto"]
+
+
 class TestFallbackModelsIntegration:
     """Integration tests for FALLBACK_MODELS with ModelResolver."""
     
