@@ -14,6 +14,7 @@ Tests for:
 import pytest
 import json
 import uuid
+import httpx
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kiro.streaming_anthropic import (
@@ -1667,3 +1668,319 @@ class TestStreamingAnthropicTruncationDetection:
         # Should detect truncation and set max_tokens
         assert result["stop_reason"] == "max_tokens"
         print("✓ collect_anthropic_response detects truncation correctly")
+
+
+
+# ==================================================================================================
+# Issue #129 - mid-stream transport drop close-out (Anthropic path)
+# ==================================================================================================
+
+def _parse_anthropic_events(chunks):
+    """
+    Parses a list of Anthropic SSE strings into a list of (event_name, payload) pairs.
+    """
+    parsed = []
+    for chunk in chunks:
+        event_name = None
+        payload = None
+        for line in chunk.strip().split("\n"):
+            if line.startswith("event: "):
+                event_name = line[len("event: "):]
+            elif line.startswith("data: "):
+                payload = json.loads(line[len("data: "):])
+        if event_name:
+            parsed.append((event_name, payload))
+    return parsed
+
+
+def _dropping_aiter_bytes(chunks, error):
+    """
+    Builds an aiter_bytes replacement that yields `chunks` then raises `error`.
+    Mirrors the mock_aiter_bytes harness in tests/conftest.py.
+    """
+    def aiter_bytes():
+        async def gen():
+            for chunk in chunks:
+                yield chunk
+            raise error
+        return gen()
+    return aiter_bytes
+
+
+class TestAnthropicMidstreamDropCloseOut:
+    """
+    Issue #129: a mid-stream transport drop must end the client stream as a
+    well-formed (truncated) turn rather than as a transport crash.
+    """
+
+    @pytest.mark.asyncio
+    async def test_remote_protocol_error_closes_stream_gracefully(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Two content chunks then httpx.RemoteProtocolError from aiter_bytes.
+        Goal: Stream ends with exactly one content_block_stop per opened index,
+              exactly one message_delta with non-null stop_reason, exactly one
+              message_stop, no second message_start, and no exception escapes.
+        """
+        from tests.conftest import create_kiro_content_chunk
+
+        print("Setup: aiter_bytes yields two content chunks then RemoteProtocolError...")
+        mock_response.aiter_bytes = _dropping_aiter_bytes(
+            [create_kiro_content_chunk("Hello"), create_kiro_content_chunk(" world")],
+            httpx.RemoteProtocolError("peer closed connection without sending complete message body"),
+        )
+
+        print("Action: Streaming to Anthropic format (no exception expected)...")
+        chunks = []
+        async for chunk in stream_kiro_to_anthropic(
+            mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+        ):
+            chunks.append(chunk)
+
+        events = _parse_anthropic_events(chunks)
+        names = [name for name, _ in events]
+        print(f"Event sequence: {names}")
+
+        assert names.count("message_start") == 1, "message_start must be sent exactly once"
+        assert names.count("message_stop") == 1, "message_stop must be sent exactly once"
+        assert names.count("message_delta") == 1, "message_delta must be sent exactly once"
+
+        # Exactly one content_block_stop per opened index
+        opened = [p["index"] for n, p in events if n == "content_block_start"]
+        stopped = [p["index"] for n, p in events if n == "content_block_stop"]
+        print(f"Opened indices: {opened}, stopped indices: {stopped}")
+        assert sorted(opened) == sorted(stopped)
+        assert len(stopped) == len(set(stopped)), "each index closed exactly once"
+
+        # message_stop must be last, message_delta immediately before it
+        assert names[-1] == "message_stop"
+        assert names[-2] == "message_delta"
+
+        delta_payload = [p for n, p in events if n == "message_delta"][0]
+        stop_reason = delta_payload["delta"]["stop_reason"]
+        print(f"stop_reason: {stop_reason}")
+        assert stop_reason is not None, "stop_reason must be non-null"
+        assert stop_reason == "max_tokens"
+
+        # Partial content was still delivered
+        text = "".join(
+            p["delta"]["text"] for n, p in events
+            if n == "content_block_delta" and p["delta"].get("type") == "text_delta"
+        )
+        assert text == "Hello world"
+        print("✓ Stream closed out as a well-formed truncated turn")
+
+    @pytest.mark.asyncio
+    async def test_generator_exit_still_propagates(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Injects GeneratorExit mid-stream.
+        Goal: CRITICAL - GeneratorExit must never be swallowed by the close-out
+              branch, otherwise the ASGI task hangs.
+        """
+        print("Setup: Mock stream raising GeneratorExit after content...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Partial")
+            raise GeneratorExit()
+
+        print("Action: Streaming and expecting GeneratorExit to escape...")
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with pytest.raises(GeneratorExit):
+                async for _ in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    pass
+        print("✓ GeneratorExit propagated")
+
+    @pytest.mark.asyncio
+    async def test_interrupted_tool_use_is_dropped(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Drop occurs while a tool call's argument JSON is incomplete.
+        Goal: The partial tool must NOT be emitted, and stop_reason must not be
+              "tool_use" (the harness would wait forever for a tool result).
+        """
+        from tests.conftest import create_kiro_content_chunk
+
+        print("Setup: content, then a tool call whose input JSON is cut off...")
+        mock_response.aiter_bytes = _dropping_aiter_bytes(
+            [
+                create_kiro_content_chunk("Let me call a tool"),
+                b'{"name":"Write","toolUseId":"tool-129"}',
+                b'{"input":"{\\"path\\": \\"/tmp/a.txt\\", \\"conte'
+            ],
+            httpx.RemoteProtocolError("peer closed connection"),
+        )
+
+        print("Action: Streaming to Anthropic format...")
+        chunks = []
+        async for chunk in stream_kiro_to_anthropic(
+            mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+        ):
+            chunks.append(chunk)
+
+        events = _parse_anthropic_events(chunks)
+        names = [n for n, _ in events]
+        print(f"Event sequence: {names}")
+
+        tool_starts = [
+            p for n, p in events
+            if n == "content_block_start" and (p.get("content_block") or {}).get("type") == "tool_use"
+        ]
+        print(f"tool_use blocks emitted: {len(tool_starts)}")
+        assert tool_starts == [], "an interrupted tool_use must be dropped, not emitted"
+
+        # No invalid JSON leaked as an input_json_delta
+        for n, p in events:
+            if n == "content_block_delta" and p["delta"].get("type") == "input_json_delta":
+                json.loads(p["delta"]["partial_json"])  # must be valid if present
+
+        delta_payload = [p for n, p in events if n == "message_delta"][0]
+        stop_reason = delta_payload["delta"]["stop_reason"]
+        print(f"stop_reason: {stop_reason}")
+        assert stop_reason is not None
+        assert stop_reason != "tool_use"
+        assert names[-1] == "message_stop"
+        print("✓ Partial tool dropped and stop_reason is safe")
+
+    @pytest.mark.asyncio
+    async def test_drop_inside_thinking_block_closes_it(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Drop occurs while a thinking content block is still open.
+        Goal: The thinking block is closed cleanly (no synthesized closing tag in
+              user-visible text) and the turn is finalised.
+        """
+        print("Setup: Mock stream with thinking content, then a transport drop...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="Considering options")
+            raise httpx.RemoteProtocolError("peer closed connection")
+
+        print("Action: Streaming to Anthropic format...")
+        chunks = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.FAKE_REASONING_HANDLING', 'as_reasoning_content'):
+                async for chunk in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        events = _parse_anthropic_events(chunks)
+        names = [n for n, _ in events]
+        print(f"Event sequence: {names}")
+
+        thinking_starts = [
+            p["index"] for n, p in events
+            if n == "content_block_start" and (p.get("content_block") or {}).get("type") == "thinking"
+        ]
+        stopped = [p["index"] for n, p in events if n == "content_block_stop"]
+        print(f"thinking indices: {thinking_starts}, stopped: {stopped}")
+        assert thinking_starts, "thinking block should have been opened"
+        assert sorted(thinking_starts) == sorted(stopped)
+        assert names[-2:] == ["message_delta", "message_stop"]
+
+        # No fake closing tag pushed into user-visible text
+        text = "".join(
+            p["delta"]["text"] for n, p in events
+            if n == "content_block_delta" and p["delta"].get("type") == "text_delta"
+        )
+        assert "</thinking>" not in text
+        print("✓ Thinking block closed cleanly")
+
+    @pytest.mark.asyncio
+    async def test_midstream_resume_disabled_by_default(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Drop with MIDSTREAM_RESUME at its default value.
+        Goal: No continuation is attempted - assert no second upstream call.
+        """
+        print("Setup: Verify default flag value and mock the continuation helper...")
+        from kiro import config
+        assert config.MIDSTREAM_RESUME is False, "MIDSTREAM_RESUME must default to false"
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Partial answer")
+            raise httpx.RemoteProtocolError("peer closed connection")
+
+        continuation_calls = []
+
+        async def spy_continuation(*args, **kwargs):
+            continuation_calls.append(kwargs)
+            return
+            yield  # pragma: no cover - generator marker
+
+        print("Action: Streaming with the flag off...")
+        chunks = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.stream_midstream_continuation', spy_continuation):
+                async for chunk in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        print(f"Continuation attempts: {len(continuation_calls)}")
+        assert continuation_calls == [], "no upstream continuation call may be made by default"
+
+        events = _parse_anthropic_events(chunks)
+        assert [n for n, _ in events][-1] == "message_stop"
+        print("✓ No continuation attempted with the flag off")
+
+    @pytest.mark.asyncio
+    async def test_midstream_resume_enabled_trims_overlap(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Flag on, continuation returns text overlapping what was sent.
+        Goal: The overlap is trimmed so no duplicate text reaches the client, and the
+              continuation is emitted on the EXISTING text block index.
+        """
+        print("Setup: Flag on, mocked successful continuation with overlap...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="The quick brown")
+            raise httpx.RemoteProtocolError("peer closed connection")
+
+        async def mock_continuation(*args, **kwargs):
+            from kiro.streaming_core import trim_continuation_overlap
+            partial = kwargs["partial_content"]
+            raw = " brown fox jumps over the lazy dog."
+            yield trim_continuation_overlap(partial, raw)
+
+        print("Action: Streaming with MIDSTREAM_RESUME enabled...")
+        chunks = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.stream_midstream_continuation', mock_continuation):
+                with patch('kiro.config.MIDSTREAM_RESUME', True):
+                    async for chunk in stream_kiro_to_anthropic(
+                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                    ):
+                        chunks.append(chunk)
+
+        events = _parse_anthropic_events(chunks)
+        names = [n for n, _ in events]
+        print(f"Event sequence: {names}")
+
+        text_deltas = [
+            (p["index"], p["delta"]["text"]) for n, p in events
+            if n == "content_block_delta" and p["delta"].get("type") == "text_delta"
+        ]
+        full_text = "".join(t for _, t in text_deltas)
+        print(f"Full delivered text: {full_text!r}")
+
+        assert full_text == "The quick brown fox jumps over the lazy dog."
+        assert full_text.count("brown") == 1, "overlapping text must not be duplicated"
+
+        # Continuation went to the already-open block index; no new block was opened
+        indices = {i for i, _ in text_deltas}
+        assert len(indices) == 1, "continuation must reuse the existing text block index"
+        assert names.count("message_start") == 1
+        assert names.count("message_stop") == 1
+        assert names[-1] == "message_stop"
+        print("✓ Overlap trimmed, existing block reused")

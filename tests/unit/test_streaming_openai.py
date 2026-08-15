@@ -1485,3 +1485,132 @@ class TestStreamingOpenaiTruncationDetection:
         # Should extract "length" from streaming chunks
         assert result["choices"][0]["finish_reason"] == "length"
         print("✓ collect_stream_response extracts finish_reason correctly")
+
+
+
+# ==================================================================================================
+# Issue #129 - mid-stream transport drop close-out (OpenAI path)
+# ==================================================================================================
+
+def _parse_openai_chunks(chunks):
+    """
+    Splits a list of OpenAI SSE strings into (parsed_payloads, saw_done) where
+    parsed_payloads excludes the [DONE] sentinel.
+    """
+    payloads = []
+    done_seen = 0
+    for chunk in chunks:
+        for line in chunk.strip().split("\n"):
+            if not line.startswith("data: "):
+                continue
+            body = line[len("data: "):]
+            if body == "[DONE]":
+                done_seen += 1
+            else:
+                payloads.append(json.loads(body))
+    return payloads, done_seen
+
+
+class TestOpenAIMidstreamDropCloseOut:
+    """
+    Issue #129: a mid-stream transport drop must terminate the OpenAI SSE stream with
+    a single non-null finish_reason chunk followed by [DONE], never with an exception.
+    """
+
+    @pytest.mark.asyncio
+    async def test_remote_protocol_error_ends_with_finish_reason_and_done(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Two content chunks then httpx.RemoteProtocolError from aiter_bytes.
+        Goal: Exactly one non-null finish_reason chunk, followed by data: [DONE],
+              with no content after it and no exception escaping.
+        """
+        import httpx as _httpx
+        from tests.conftest import create_kiro_content_chunk
+
+        print("Setup: aiter_bytes yields two content chunks then RemoteProtocolError...")
+
+        def aiter_bytes():
+            async def gen():
+                yield create_kiro_content_chunk("Hello")
+                yield create_kiro_content_chunk(" world")
+                raise _httpx.RemoteProtocolError(
+                    "peer closed connection without sending complete message body"
+                )
+            return gen()
+
+        mock_response.aiter_bytes = aiter_bytes
+
+        print("Action: Streaming to OpenAI format (no exception expected)...")
+        chunks = []
+        async for chunk in stream_kiro_to_openai_internal(
+            mock_http_client, mock_response, "claude-sonnet-4",
+            mock_model_cache, mock_auth_manager
+        ):
+            chunks.append(chunk)
+
+        payloads, done_seen = _parse_openai_chunks(chunks)
+        finish_reasons = [p["choices"][0].get("finish_reason") for p in payloads]
+        print(f"finish_reasons: {finish_reasons}, [DONE] count: {done_seen}")
+
+        non_null = [f for f in finish_reasons if f is not None]
+        assert len(non_null) == 1, "exactly one non-null finish_reason chunk"
+        assert non_null[0] == "length"
+        assert done_seen == 1, "exactly one [DONE] sentinel"
+
+        # [DONE] must be the very last thing on the wire
+        assert chunks[-1].strip() == "data: [DONE]"
+        # finish_reason must be on the last data payload, with no content after it
+        assert finish_reasons[-1] == "length"
+        assert payloads[-1]["choices"][0]["delta"] == {}
+
+        # role delta sent only once
+        roles = [p["choices"][0]["delta"].get("role") for p in payloads]
+        print(f"role deltas: {roles}")
+        assert roles.count("assistant") == 1
+
+        text = "".join(p["choices"][0]["delta"].get("content") or "" for p in payloads)
+        assert text == "Hello world"
+        print("✓ OpenAI stream closed out as a well-formed truncated completion")
+
+    @pytest.mark.asyncio
+    async def test_midstream_resume_disabled_by_default(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Drop with MIDSTREAM_RESUME at its default value.
+        Goal: No continuation is attempted (no second upstream call).
+        """
+        import httpx as _httpx
+        from kiro import config
+
+        print("Setup: Verify default flag value...")
+        assert config.MIDSTREAM_RESUME is False, "MIDSTREAM_RESUME must default to false"
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Partial")
+            raise _httpx.RemoteProtocolError("peer closed connection")
+
+        continuation_calls = []
+
+        async def spy_continuation(*args, **kwargs):
+            continuation_calls.append(kwargs)
+            return
+            yield  # pragma: no cover - generator marker
+
+        print("Action: Streaming with the flag off...")
+        chunks = []
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                with patch('kiro.streaming_openai.stream_midstream_continuation', spy_continuation):
+                    async for chunk in stream_kiro_to_openai_internal(
+                        mock_http_client, mock_response, "claude-sonnet-4",
+                        mock_model_cache, mock_auth_manager
+                    ):
+                        chunks.append(chunk)
+
+        print(f"Continuation attempts: {len(continuation_calls)}")
+        assert continuation_calls == []
+        assert chunks[-1].strip() == "data: [DONE]"
+        print("✓ No continuation attempted with the flag off")

@@ -31,6 +31,7 @@ This module formats Kiro events into Anthropic SSE format:
 Reference: https://docs.anthropic.com/en/api/messages-streaming
 """
 
+import asyncio
 import json
 import time
 import uuid
@@ -46,6 +47,12 @@ from kiro.streaming_core import (
     KiroEvent,
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
+    stream_midstream_continuation,
+)
+from kiro.network_errors import (
+    TRANSPORT_DROP_EXCEPTIONS,
+    is_transport_drop_error,
+    describe_transport_drop,
 )
 from kiro.tokenizer import count_tokens, estimate_request_tokens
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
@@ -190,6 +197,10 @@ async def stream_kiro_to_anthropic(
     text_block_index: Optional[int] = None
     tool_blocks: List[Dict[str, Any]] = []
     tool_input_buffers: Dict[int, str] = {}  # index -> accumulated JSON
+    # True while a tool_use content block is open (opened but not yet stopped).
+    # A drop while this is True means the tool's argument JSON is incomplete: the
+    # partial tool must be dropped, and no continuation may be attempted.
+    pending_tool_block = False
     
     # Generate signature for thinking block (used if thinking is present)
     thinking_signature = generate_thinking_signature()
@@ -483,6 +494,7 @@ async def stream_kiro_to_anthropic(
                         tool_input = {}
                 
                 # Send tool_use block start
+                pending_tool_block = True
                 yield format_sse_event("content_block_start", {
                     "type": "content_block_start",
                     "index": current_block_index,
@@ -510,6 +522,7 @@ async def stream_kiro_to_anthropic(
                     "type": "content_block_stop",
                     "index": current_block_index
                 })
+                pending_tool_block = False
                 
                 tool_blocks.append({
                     "id": tool_id,
@@ -697,6 +710,140 @@ async def stream_kiro_to_anthropic(
     except GeneratorExit:
         logger.debug("Client disconnected (GeneratorExit)")
         raise
+    except asyncio.CancelledError:
+        # Must always propagate - swallowing it hangs the ASGI task
+        raise
+    except TRANSPORT_DROP_EXCEPTIONS as e:
+        # ==========================================================================
+        # Issue #129 - graceful close-out of a mid-stream transport drop.
+        #
+        # The upstream byte stream died mid-response. Previously this propagated and
+        # the client saw a stream that simply stopped: no content_block_stop, no
+        # message_delta, no message_stop. Harnesses (OpenCode, Claude Code) read that
+        # as a transport crash and abort the session entirely.
+        #
+        # Instead we end the stream as a well-formed TRUNCATED turn. The client keeps
+        # the partial answer and can ask the model to continue.
+        # ==========================================================================
+        if not is_transport_drop_error(e):  # pragma: no cover - defensive
+            raise
+
+        streaming_begun = bool(full_content or full_thinking_content or tool_blocks)
+        if not streaming_begun:
+            # Pre-first-token failure: nothing useful was delivered, so there is no
+            # well-formed turn to close out. Let the route layer surface an error.
+            logger.warning(f"Anthropic streaming failed before first token: {describe_transport_drop(e)}")
+            raise
+
+        logger.warning(f"Anthropic streaming closed out gracefully: {describe_transport_drop(e)}")
+
+        # ---- Phase 2 (opt-in): one continuation round before closing out --------
+        # Allowed ONLY when a text block is open, no tool block is pending and we are
+        # not inside a thinking block. Never opens a new block, never re-sends
+        # message_start.
+        from kiro.config import MIDSTREAM_RESUME
+
+        resume_allowed = (
+            MIDSTREAM_RESUME
+            and text_block_started
+            and text_block_index is not None
+            and not thinking_block_started
+            and not pending_tool_block
+        )
+
+        if MIDSTREAM_RESUME and not resume_allowed:
+            logger.debug(
+                "MIDSTREAM_RESUME enabled but continuation not allowed "
+                f"(text_open={text_block_started}, thinking_open={thinking_block_started}, "
+                f"tool_pending={pending_tool_block})"
+            )
+
+        if resume_allowed:
+            try:
+                async for continuation_text in stream_midstream_continuation(
+                    model=model,
+                    request_messages=request_messages,
+                    partial_content=full_content,
+                    auth_manager=auth_manager,
+                ):
+                    full_content += continuation_text
+                    yield format_sse_event("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": text_block_index,
+                        "delta": {
+                            "type": "text_delta",
+                            "text": continuation_text
+                        }
+                    })
+            except GeneratorExit:
+                raise
+            except asyncio.CancelledError:
+                raise
+            except Exception as resume_error:
+                logger.warning(f"Midstream continuation failed, closing out: {resume_error}")
+
+        # ---- Phase 1: well-formed close-out ------------------------------------
+        # Close every block we opened, exactly once each.
+        #
+        # NOTE on partial state: an interrupted tool_use never reaches this layer as
+        # a completed KiroEvent, so a tool with incomplete argument JSON is DROPPED
+        # rather than emitted as (invalid) JSON. Tool blocks that did arrive were
+        # opened and closed synchronously above, so none can be left open here.
+        if thinking_block_started and thinking_block_index is not None:
+            yield format_sse_event("content_block_stop", {
+                "type": "content_block_stop",
+                "index": thinking_block_index
+            })
+            thinking_block_started = False
+
+        if text_block_started and text_block_index is not None:
+            yield format_sse_event("content_block_stop", {
+                "type": "content_block_stop",
+                "index": text_block_index
+            })
+            text_block_started = False
+
+        output_tokens = count_tokens(full_content + full_thinking_content)
+
+        truncation_usage_payload: Dict[str, Any] = {"output_tokens": output_tokens}
+        truncation_usage_payload.update(upstream_cache_usage)
+
+        # stop_reason MUST be non-null and MUST NOT be "tool_use": with "tool_use"
+        # the harness would block forever waiting for a tool result that will never
+        # be requested. "max_tokens" is the honest signal for "output is truncated".
+        yield format_sse_event("message_delta", {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "max_tokens",
+                "stop_sequence": None
+            },
+            "usage": truncation_usage_payload
+        })
+
+        yield format_sse_event("message_stop", {
+            "type": "message_stop"
+        })
+
+        # Record the truncation so the NEXT turn can be repaired by the existing
+        # truncation-recovery machinery.
+        try:
+            from kiro.truncation_recovery import should_inject_recovery
+            from kiro.truncation_state import save_tool_truncation, save_content_truncation
+
+            if should_inject_recovery():
+                for truncated_tool in truncated_tools:
+                    save_tool_truncation(
+                        tool_call_id=truncated_tool["id"],
+                        tool_name=truncated_tool["name"],
+                        truncation_info=truncated_tool["truncation_info"]
+                    )
+                if full_content:
+                    save_content_truncation(full_content)
+        except Exception as save_error:
+            logger.debug(f"Could not record midstream truncation state: {save_error}")
+
+        # Do NOT re-raise: the turn is well-formed from the client's point of view.
+        return
     except Exception as e:
         error_type = type(e).__name__
         error_msg = str(e) if str(e) else "(empty message)"

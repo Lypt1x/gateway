@@ -513,6 +513,29 @@ TOOL_DESCRIPTION_MAX_LENGTH: int = int(os.getenv("TOOL_DESCRIPTION_MAX_LENGTH", 
 # Default: true (enabled)
 TRUNCATION_RECOVERY: bool = os.getenv("TRUNCATION_RECOVERY", "true").lower() in ("true", "1", "yes")
 
+# Enable a single mid-stream continuation attempt when the upstream stream drops
+# mid-response (issue #129).
+#
+# Default: FALSE (disabled).
+#
+# When disabled (default) a mid-stream transport drop is closed out gracefully:
+# the client receives a well-formed but truncated turn (stop_reason=max_tokens /
+# finish_reason=length). This is always safe.
+#
+# When enabled, the gateway first attempts ONE continuation round upstream and
+# splices the continuation into the already-open text block, trimming any overlap
+# with text already sent. This is opt-in because Kiro exposes no continuation
+# token, so continuation is prompt-level and can repeat or diverge from the
+# interrupted text. On any failure it falls back to the graceful close-out.
+MIDSTREAM_RESUME: bool = os.getenv("MIDSTREAM_RESUME", "false").lower() in ("true", "1", "yes")
+
+# Budget for the mid-stream continuation (only used when MIDSTREAM_RESUME=true)
+MIDSTREAM_RESUME_MAX_ROUNDS: int = 1
+MIDSTREAM_RESUME_MAX_ATTEMPTS: int = 2
+MIDSTREAM_RESUME_BACKOFFS: tuple = (0.5, 1.5)
+MIDSTREAM_RESUME_WALL_CLOCK_CAP: float = float(os.getenv("MIDSTREAM_RESUME_WALL_CLOCK_CAP", "20"))
+MIDSTREAM_RESUME_MAX_TOKENS: int = int(os.getenv("MIDSTREAM_RESUME_MAX_TOKENS", "4096"))
+
 # ==================================================================================================
 # Logging Settings
 # ==================================================================================================

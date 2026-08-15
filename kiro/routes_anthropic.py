@@ -59,6 +59,7 @@ from kiro.streaming_anthropic import (
 )
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
+from kiro.network_errors import log_streaming_failure
 from kiro.tokenizer import estimate_request_tokens
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
@@ -482,9 +483,7 @@ async def messages(
                             finally:
                                 await http_client.close()
                                 if streaming_error:
-                                    error_type = type(streaming_error).__name__
-                                    error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
-                                    logger.error(f"HTTP 500 - POST /v1/messages (streaming) - [{error_type}] {error_msg[:100]}")
+                                    log_streaming_failure("POST /v1/messages (streaming)", streaming_error)
                                 elif client_disconnected:
                                     logger.info(f"HTTP 200 - POST /v1/messages (streaming) - client disconnected")
                                 else:
@@ -841,9 +840,7 @@ async def messages(
                 finally:
                     await http_client.close()
                     if streaming_error:
-                        error_type = type(streaming_error).__name__
-                        error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
-                        logger.error(f"HTTP 500 - POST /v1/messages (streaming) - [{error_type}] {error_msg[:100]}")
+                        log_streaming_failure("POST /v1/messages (streaming)", streaming_error)
                     elif client_disconnected:
                         logger.info(f"HTTP 200 - POST /v1/messages (streaming) - client disconnected")
                     else:

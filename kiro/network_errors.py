@@ -30,10 +30,13 @@ Architecture:
 - format_error_for_user(): Formats errors for API responses (OpenAI/Anthropic)
 """
 
+import asyncio
+import http.client
 import socket
+import ssl
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple, Type
 
 import httpx
 from loguru import logger
@@ -55,6 +58,7 @@ class ErrorCategory(str, Enum):
     SSL_ERROR = "ssl_error"
     PROXY_ERROR = "proxy_error"
     TOO_MANY_REDIRECTS = "too_many_redirects"
+    TRANSPORT_DROP = "transport_drop"
     UNKNOWN = "unknown"
 
 
@@ -77,6 +81,113 @@ class NetworkErrorInfo:
     technical_details: str
     is_retryable: bool
     suggested_http_code: int
+
+
+# ==================================================================================================
+# Mid-stream transport drop classification (upstream issue #129)
+# ==================================================================================================
+
+# Exceptions that mean "the upstream byte stream died in the middle of a response".
+# These are NOT gateway bugs - they are upstream/network behaviour. When they occur
+# AFTER streaming has begun, the streaming layer closes the client stream out as a
+# well-formed (truncated) turn instead of raising, so harnesses see a completed turn
+# rather than a transport crash.
+TRANSPORT_DROP_EXCEPTIONS: Tuple[Type[BaseException], ...] = (
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.WriteError,
+    httpx.StreamError,
+    http.client.IncompleteRead,
+    ConnectionResetError,
+    asyncio.IncompleteReadError,
+    ssl.SSLEOFError,
+)
+
+# Exceptions that MUST NEVER be treated as a transport drop and MUST NEVER be
+# swallowed by the graceful close-out path:
+#   - GeneratorExit / asyncio.CancelledError: the client went away or the ASGI task
+#     was cancelled. Swallowing these hangs the ASGI task.
+#   - FirstTokenTimeoutError: owned by the first-token retry loop, which must still
+#     see it in order to retry the upstream request.
+NEVER_SWALLOW_EXCEPTIONS: Tuple[Type[BaseException], ...] = (
+    GeneratorExit,
+    asyncio.CancelledError,
+)
+
+
+def is_transport_drop_error(error: BaseException) -> bool:
+    """
+    Returns True if the exception represents a mid-stream transport drop.
+
+    Central classifier for issue #129. Callers must use this instead of inlining
+    exception tuples so that the covered set stays in exactly one place.
+
+    Explicitly returns False for GeneratorExit, asyncio.CancelledError and
+    FirstTokenTimeoutError - those must always propagate.
+
+    Args:
+        error: The exception to classify
+
+    Returns:
+        True if this is an upstream/network mid-stream drop
+
+    Example:
+        >>> is_transport_drop_error(httpx.RemoteProtocolError("peer closed connection"))
+        True
+        >>> is_transport_drop_error(GeneratorExit())
+        False
+    """
+    if isinstance(error, NEVER_SWALLOW_EXCEPTIONS):
+        return False
+
+    # FirstTokenTimeoutError belongs to the retry loop, not to the close-out path.
+    # Imported lazily to avoid a circular import with streaming_core.
+    try:
+        from kiro.streaming_core import FirstTokenTimeoutError
+        if isinstance(error, FirstTokenTimeoutError):
+            return False
+    except Exception:  # pragma: no cover - import guard
+        pass
+
+    return isinstance(error, TRANSPORT_DROP_EXCEPTIONS)
+
+
+def describe_transport_drop(error: BaseException) -> str:
+    """
+    Short, specific one-line description of a mid-stream transport drop.
+
+    Args:
+        error: The transport drop exception
+
+    Returns:
+        Log-friendly message naming the concrete exception type and text
+    """
+    error_msg = str(error) if str(error) else "(empty message)"
+    return f"upstream stream dropped mid-response: [{type(error).__name__}] {error_msg}"
+
+
+def log_streaming_failure(route_label: str, error: BaseException) -> None:
+    """
+    Logs a streaming failure from a route wrapper at the right severity.
+
+    A mid-stream transport drop is upstream behaviour, and after issue #129 the
+    streaming layer already closed the client stream out as a well-formed truncated
+    turn for post-first-token drops. Any drop that still reaches a route wrapper is
+    therefore a PRE-first-token failure - logged as a warning naming the real cause,
+    not as "HTTP 500", which wrongly implied a gateway bug.
+
+    Args:
+        route_label: e.g. "POST /v1/messages (streaming)"
+        error: The exception that ended the stream
+    """
+    if is_transport_drop_error(error):
+        logger.warning(f"HTTP 502 - {route_label} - {describe_transport_drop(error)[:160]}")
+        return
+
+    error_type = type(error).__name__
+    error_msg = str(error) if str(error) else "(empty message)"
+    logger.error(f"HTTP 500 - {route_label} - [{error_type}] {error_msg[:100]}")
 
 
 def classify_network_error(error: Exception) -> NetworkErrorInfo:
@@ -113,6 +224,23 @@ def classify_network_error(error: Exception) -> NetworkErrorInfo:
     # Analyze httpx.TimeoutException (various timeout types)
     if isinstance(error, httpx.TimeoutException):
         return _classify_timeout_error(error, technical_details)
+    
+    # Mid-stream transport drop (issue #129) - upstream closed the stream early.
+    # Checked after ConnectError/Timeout so their more specific categories win.
+    if is_transport_drop_error(error):
+        return NetworkErrorInfo(
+            category=ErrorCategory.TRANSPORT_DROP,
+            user_message="The upstream stream ended unexpectedly before the response was complete.",
+            troubleshooting_steps=[
+                "This is an upstream/network interruption, not a gateway failure",
+                "The partial answer was delivered as a truncated turn - ask the model to continue",
+                "Try again in a few moments",
+                "Check network stability (VPN/proxy can cut long-lived streams)"
+            ],
+            technical_details=technical_details,
+            is_retryable=True,
+            suggested_http_code=502
+        )
     
     # Analyze httpx.TooManyRedirects
     if isinstance(error, httpx.TooManyRedirects):

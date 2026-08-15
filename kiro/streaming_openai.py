@@ -32,6 +32,7 @@ import json
 import time
 from typing import TYPE_CHECKING, AsyncGenerator, Callable, Awaitable, Optional
 
+import asyncio
 import httpx
 from fastapi import HTTPException
 from loguru import logger
@@ -52,6 +53,12 @@ from kiro.streaming_core import (
     KiroEvent,
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry as stream_with_first_token_retry_core,
+    stream_midstream_continuation,
+)
+from kiro.network_errors import (
+    TRANSPORT_DROP_EXCEPTIONS,
+    is_transport_drop_error,
+    describe_transport_drop,
 )
 
 if TYPE_CHECKING:
@@ -125,6 +132,9 @@ async def stream_kiro_to_openai_internal(
     
     streaming_error_occurred = False
     tool_calls_from_stream = []
+    # True while thinking/reasoning content is being emitted and no regular content
+    # has followed it yet. No continuation may be attempted from inside it.
+    thinking_active = False
     
     try:
         # Use streaming_core.parse_kiro_stream for unified event parsing
@@ -133,6 +143,7 @@ async def stream_kiro_to_openai_internal(
             if event.type == "content" and event.content:
                 # Accumulate content for bracket tool call detection
                 full_content += event.content
+                thinking_active = False
                 
                 # Format as OpenAI chunk
                 delta = {"content": event.content}
@@ -158,6 +169,7 @@ async def stream_kiro_to_openai_internal(
             elif event.type == "thinking" and event.thinking_content:
                 # Accumulate thinking content
                 full_thinking_content += event.thinking_content
+                thinking_active = True
                 
                 # Send as reasoning_content or content based on mode
                 if FAKE_REASONING_HANDLING == "as_reasoning_content":
@@ -420,9 +432,128 @@ async def stream_kiro_to_openai_internal(
         # Propagate timeout up for retry
         raise
     except GeneratorExit:
-        # Client disconnected - this is normal, don't log as error
+        # Client disconnected - this is normal, don't log as error.
+        # Pre-existing behaviour: not re-raised here (the generator simply returns
+        # after `finally`, which is a legal unwind). The authoritative re-raise lives
+        # in streaming_core.parse_kiro_stream.
         logger.debug("Client disconnected (GeneratorExit)")
         streaming_error_occurred = True
+    except asyncio.CancelledError:
+        # Must always propagate - swallowing it hangs the ASGI task
+        streaming_error_occurred = True
+        raise
+    except TRANSPORT_DROP_EXCEPTIONS as e:
+        # ==========================================================================
+        # Issue #129 - graceful close-out of a mid-stream transport drop.
+        # End the SSE stream as a well-formed (truncated) completion instead of
+        # raising, so harnesses see a finished turn rather than a transport crash.
+        # ==========================================================================
+        if not is_transport_drop_error(e):  # pragma: no cover - defensive
+            raise
+
+        streaming_error_occurred = True
+
+        streaming_begun = bool(full_content or full_thinking_content or tool_calls_from_stream)
+        if not streaming_begun:
+            # Pre-first-token failure: let the route layer surface an error instead
+            logger.warning(f"OpenAI streaming failed before first token: {describe_transport_drop(e)}")
+            raise
+
+        logger.warning(f"OpenAI streaming closed out gracefully: {describe_transport_drop(e)}")
+
+        # ---- Phase 2 (opt-in): one continuation round before closing out --------
+        from kiro.config import MIDSTREAM_RESUME
+
+        resume_allowed = (
+            MIDSTREAM_RESUME
+            and bool(full_content)
+            and not thinking_active
+            and not tool_calls_from_stream
+        )
+
+        if MIDSTREAM_RESUME and not resume_allowed:
+            logger.debug(
+                "MIDSTREAM_RESUME enabled but continuation not allowed "
+                f"(content={bool(full_content)}, thinking_active={thinking_active}, "
+                f"tools={len(tool_calls_from_stream)})"
+            )
+
+        if resume_allowed:
+            try:
+                async for continuation_text in stream_midstream_continuation(
+                    model=model,
+                    request_messages=request_messages,
+                    partial_content=full_content,
+                    auth_manager=auth_manager,
+                ):
+                    full_content += continuation_text
+                    # `role` was already sent with the first delta; never repeat it
+                    resume_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": continuation_text},
+                            "finish_reason": None
+                        }]
+                    }
+                    yield f"data: {json.dumps(resume_chunk, ensure_ascii=False)}\n\n"
+            except GeneratorExit:
+                raise
+            except asyncio.CancelledError:
+                raise
+            except Exception as resume_error:
+                logger.warning(f"Midstream continuation failed, closing out: {resume_error}")
+
+        # ---- Phase 1: well-formed close-out ------------------------------------
+        # An interrupted tool call never arrives as a completed event, so a tool with
+        # incomplete argument JSON is DROPPED rather than emitted as invalid JSON.
+        # finish_reason is "length" (truncated output) - never "tool_calls", which
+        # would leave the harness waiting forever for a tool result.
+        completion_tokens = count_tokens(full_content + full_thinking_content)
+        prompt_tokens, total_tokens, _, _ = calculate_tokens_from_context_usage(
+            context_usage_percentage, completion_tokens, model_cache, model
+        )
+
+        truncated_final_chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created_time,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            }
+        }
+
+        # Exactly one non-null finish_reason chunk, then [DONE]. Nothing after.
+        yield f"data: {json.dumps(truncated_final_chunk, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+
+        # Record the truncation for the next turn via the existing machinery
+        try:
+            from kiro.truncation_recovery import should_inject_recovery
+            from kiro.truncation_state import save_tool_truncation, save_content_truncation
+
+            if should_inject_recovery():
+                for tc in tool_calls_from_stream:
+                    if tc.get('_truncation_detected'):
+                        save_tool_truncation(
+                            tool_call_id=tc['id'],
+                            tool_name=tc['function']['name'],
+                            truncation_info=tc['_truncation_info']
+                        )
+                if full_content:
+                    save_content_truncation(full_content)
+        except Exception as save_error:
+            logger.debug(f"Could not record midstream truncation state: {save_error}")
+
+        # Do NOT re-raise: the turn is well-formed from the client's point of view.
+        return
     except Exception as e:
         streaming_error_occurred = True
         # Log exception type and message for better diagnostics

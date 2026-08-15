@@ -54,6 +54,7 @@ from kiro.converters_openai import build_kiro_payload
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
+from kiro.network_errors import log_streaming_failure
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
 
@@ -410,9 +411,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             finally:
                                 await http_client.close()
                                 if streaming_error:
-                                    error_type = type(streaming_error).__name__
-                                    error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
-                                    logger.error(f"HTTP 500 - POST /v1/chat/completions (streaming) - [{error_type}] {error_msg[:100]}")
+                                    log_streaming_failure("POST /v1/chat/completions (streaming)", streaming_error)
                                 elif client_disconnected:
                                     logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - client disconnected")
                                 else:
@@ -710,9 +709,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     await http_client.close()
                     # Log access log for streaming (success or error)
                     if streaming_error:
-                        error_type = type(streaming_error).__name__
-                        error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
-                        logger.error(f"HTTP 500 - POST /v1/chat/completions (streaming) - [{error_type}] {error_msg[:100]}")
+                        log_streaming_failure("POST /v1/chat/completions (streaming)", streaming_error)
                     elif client_disconnected:
                         logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - client disconnected")
                     else:

@@ -45,6 +45,7 @@ from kiro.config import (
     FAKE_REASONING_HANDLING,
 )
 from kiro.thinking_parser import ThinkingParser
+from kiro.network_errors import is_transport_drop_error, describe_transport_drop
 
 if TYPE_CHECKING:
     from kiro.cache import ModelInfoCache
@@ -220,10 +221,19 @@ async def parse_kiro_stream(
     except GeneratorExit:
         logger.debug("Client disconnected (GeneratorExit)")
         raise
+    except asyncio.CancelledError:
+        # Task cancellation must always propagate - swallowing it hangs the ASGI task
+        raise
     except Exception as e:
         error_type = type(e).__name__
         error_msg = str(e) if str(e) else "(empty message)"
-        logger.error(f"Error during stream parsing: [{error_type}] {error_msg}", exc_info=True)
+        # Mid-stream transport drops (issue #129) are upstream behaviour, not a
+        # gateway bug. Still re-raised so the formatting layer can close the client
+        # stream out as a well-formed truncated turn, but logged as WARNING.
+        if is_transport_drop_error(e):
+            logger.warning(f"Kiro stream parsing stopped: {describe_transport_drop(e)}")
+        else:
+            logger.error(f"Error during stream parsing: [{error_type}] {error_msg}", exc_info=True)
         raise
 
 
@@ -503,3 +513,232 @@ async def stream_with_first_token_retry(
             f"Model did not respond within {first_token_timeout}s after {max_retries} attempts. "
             "Please try again."
         )
+
+
+
+# ==================================================================================================
+# Mid-stream continuation (issue #129, Phase 2 - gated by MIDSTREAM_RESUME, default FALSE)
+# ==================================================================================================
+
+MIDSTREAM_CONTINUATION_INSTRUCTION = (
+    "Your previous reply was cut off mid-sentence by a network interruption. "
+    "Continue the reply from exactly where it stopped. "
+    "Do not repeat any text you already produced, do not restate or summarise it, "
+    "and do not start a new introduction - just carry on."
+)
+
+# Only the tail of already-sent content is inspected for overlap. Long enough to
+# catch a repeated paragraph, short enough to stay cheap.
+_OVERLAP_WINDOW = 2000
+
+
+def trim_continuation_overlap(sent_content: str, continuation: str) -> str:
+    """
+    Removes the longest overlap between the tail of already-sent content and the
+    head of a continuation.
+
+    Prompt-level continuation frequently re-emits some of the text the client has
+    already received. Text already sent cannot be un-sent, so the only safe repair
+    is to drop the duplicated prefix from the continuation.
+
+    Args:
+        sent_content: Everything already delivered to the client
+        continuation: Freshly received continuation text
+
+    Returns:
+        The continuation with its duplicated leading portion removed
+
+    Example:
+        >>> trim_continuation_overlap("The quick brown", " brown fox jumps")
+        ' fox jumps'
+    """
+    if not sent_content or not continuation:
+        return continuation
+
+    tail = sent_content[-_OVERLAP_WINDOW:]
+    max_overlap = min(len(tail), len(continuation))
+
+    # Longest suffix of `tail` that is also a prefix of `continuation`
+    for size in range(max_overlap, 0, -1):
+        if tail.endswith(continuation[:size]):
+            trimmed = continuation[size:]
+            logger.debug(f"Midstream continuation: trimmed {size} overlapping chars")
+            return trimmed
+
+    return continuation
+
+
+def _build_continuation_messages(
+    request_messages: Optional[List[Any]],
+    partial_content: str,
+) -> List[Dict[str, Any]]:
+    """
+    Builds the continuation message list: original turns + the partial assistant
+    reply + an explicit "continue where you stopped" user instruction.
+
+    Args:
+        request_messages: Original request messages (Anthropic-shaped dicts)
+        partial_content: Text already streamed to the client
+
+    Returns:
+        Message list for the continuation request
+    """
+    messages: List[Dict[str, Any]] = []
+
+    for msg in (request_messages or []):
+        if isinstance(msg, dict):
+            role = msg.get("role")
+            content = msg.get("content")
+        else:
+            role = getattr(msg, "role", None)
+            content = getattr(msg, "content", None)
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+
+    messages.append({"role": "assistant", "content": partial_content})
+    messages.append({"role": "user", "content": MIDSTREAM_CONTINUATION_INSTRUCTION})
+
+    return messages
+
+
+async def stream_midstream_continuation(
+    model: str,
+    request_messages: Optional[List[Any]],
+    partial_content: str,
+    auth_manager: Any,
+) -> AsyncGenerator[str, None]:
+    """
+    Attempts ONE continuation round after a mid-stream transport drop and yields
+    content-only text fragments, already trimmed of overlap with `partial_content`.
+
+    Structurally modelled on the web-search synthesis continuation: build request ->
+    convert -> request_with_retry(stream=True) -> parse_kiro_stream, yielding content
+    only. Best-effort: any failure yields nothing and returns, so the caller falls
+    through to the Phase 1 graceful close-out. GeneratorExit and CancelledError are
+    always propagated.
+
+    Budget (see kiro.config):
+      - 1 continuation round
+      - MIDSTREAM_RESUME_MAX_ATTEMPTS upstream attempts
+      - MIDSTREAM_RESUME_BACKOFFS between attempts
+      - MIDSTREAM_RESUME_WALL_CLOCK_CAP hard wall-clock cap
+
+    Args:
+        model: Model name for the continuation request
+        request_messages: Original request messages
+        partial_content: Text already delivered to the client
+        auth_manager: KiroAuthManager instance (may be None)
+
+    Yields:
+        Text fragments to append to the already-open text block.
+    """
+    import time as _time
+
+    from kiro.config import (
+        MIDSTREAM_RESUME_MAX_ATTEMPTS,
+        MIDSTREAM_RESUME_BACKOFFS,
+        MIDSTREAM_RESUME_WALL_CLOCK_CAP,
+        MIDSTREAM_RESUME_MAX_TOKENS,
+    )
+
+    if auth_manager is None or not partial_content:
+        logger.debug("Midstream continuation skipped: no auth_manager or no partial content")
+        return
+
+    try:
+        from kiro.models_anthropic import AnthropicMessagesRequest
+        from kiro.converters_anthropic import anthropic_to_kiro
+        from kiro.http_client import KiroHttpClient
+        from kiro.utils import generate_conversation_id
+    except Exception as e:  # pragma: no cover - import guard
+        logger.warning(f"Midstream continuation unavailable (import failed): {e}")
+        return
+
+    deadline = _time.monotonic() + MIDSTREAM_RESUME_WALL_CLOCK_CAP
+    sent_so_far = partial_content
+    emitted_any = False
+
+    for attempt in range(MIDSTREAM_RESUME_MAX_ATTEMPTS):
+        if _time.monotonic() >= deadline:
+            logger.warning("Midstream continuation abandoned: wall-clock cap reached")
+            return
+
+        if attempt > 0:
+            backoff = MIDSTREAM_RESUME_BACKOFFS[min(attempt - 1, len(MIDSTREAM_RESUME_BACKOFFS) - 1)]
+            await asyncio.sleep(backoff)
+            if _time.monotonic() >= deadline:
+                logger.warning("Midstream continuation abandoned: wall-clock cap reached")
+                return
+
+        http_client = None
+        try:
+            continuation_request = AnthropicMessagesRequest(
+                model=model,
+                max_tokens=MIDSTREAM_RESUME_MAX_TOKENS,
+                stream=True,
+                messages=_build_continuation_messages(request_messages, partial_content),
+            )
+
+            payload = anthropic_to_kiro(
+                continuation_request,
+                generate_conversation_id(),
+                getattr(auth_manager, "profile_arn", "") or ""
+            )
+
+            url = f"{auth_manager.api_host}/generateAssistantResponse"
+            logger.info(
+                f"Midstream continuation attempt {attempt + 1}/{MIDSTREAM_RESUME_MAX_ATTEMPTS} via {url}"
+            )
+
+            http_client = KiroHttpClient(auth_manager, shared_client=None)
+            response = await http_client.request_with_retry("POST", url, payload, stream=True)
+
+            if getattr(response, "status_code", None) != 200:
+                logger.warning(
+                    f"Midstream continuation failed: upstream status "
+                    f"{getattr(response, 'status_code', 'unknown')}"
+                )
+                continue
+
+            async for event in parse_kiro_stream(response):
+                if getattr(event, "type", None) != "content":
+                    continue
+                content = getattr(event, "content", None)
+                if not content:
+                    continue
+
+                # Trim overlap against everything the client has already seen.
+                # Only the first fragments can overlap; once we have emitted
+                # something the continuation is by definition new text.
+                if not emitted_any:
+                    content = trim_continuation_overlap(sent_so_far, content)
+                    if not content:
+                        continue
+
+                emitted_any = True
+                sent_so_far += content
+                yield content
+
+            if emitted_any:
+                return
+
+            logger.warning("Midstream continuation produced no new content")
+            return
+
+        except GeneratorExit:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(
+                f"Midstream continuation attempt {attempt + 1} failed, degrading: "
+                f"[{type(e).__name__}] {e}"
+            )
+        finally:
+            if http_client is not None:
+                try:
+                    await http_client.close()
+                except Exception as e:
+                    logger.debug(f"Midstream continuation: error closing HTTP client: {e}")
+
+    logger.warning("Midstream continuation exhausted its budget; falling back to close-out")
