@@ -69,6 +69,55 @@ except ImportError:
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 
+def build_sse_error_chunk(error: BaseException) -> str:
+    """
+    Builds an OpenAI-shaped SSE error chunk for a failure that happened mid-stream.
+
+    Once StreamingResponse has emitted its headers, the HTTP status code can no longer
+    be changed and re-raising from the generator makes Starlette abort the connection
+    with "Caught handled exception, but response already started". The client then sees
+    only `data: [DONE]` with no content and no reason. Reporting the failure in-band
+    keeps the reason visible, mirroring what /v1/messages does with `event: error`.
+
+    Args:
+        error: The exception that ended the stream. For HTTPException the real
+               status_code and detail are preserved (e.g. 504 first-token timeout);
+               anything else is reported as 500.
+
+    Returns:
+        A single SSE chunk: `data: {"error": {...}}\\n\\n`
+    """
+    status_code = getattr(error, "status_code", 500)
+    detail = getattr(error, "detail", None)
+    message = str(detail) if detail else (str(error) or type(error).__name__)
+    return "data: " + json.dumps({
+        "error": {
+            "message": message,
+            "type": "kiro_api_error",
+            "code": status_code,
+        }
+    }) + "\n\n"
+
+
+def log_streaming_error(route_label: str, error: BaseException) -> None:
+    """
+    Logs a mid-stream failure at the accurate status.
+
+    An HTTPException carries the status the route already decided on (e.g. 504 for a
+    first-token timeout), so logging it as "HTTP 500" wrongly implies a gateway bug.
+    Everything else is delegated to the shared log_streaming_failure() classifier.
+
+    Args:
+        route_label: e.g. "POST /v1/chat/completions (streaming)"
+        error: The exception that ended the stream
+    """
+    if isinstance(error, HTTPException):
+        detail = str(error.detail) if error.detail else "(no detail)"
+        logger.warning(f"HTTP {error.status_code} - {route_label} - {detail[:160]}")
+        return
+    log_streaming_failure(route_label, error)
+
+
 async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
     """
     Verify API key in Authorization header.
@@ -403,22 +452,24 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                 logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
                             except Exception as e:
                                 streaming_error = e
+                                # Headers are already sent - report in-band and end
+                                # the generator normally (see build_sse_error_chunk)
                                 try:
+                                    yield build_sse_error_chunk(e)
                                     yield "data: [DONE]\n\n"
                                 except Exception:
-                                    pass
-                                raise
+                                    pass  # Client already disconnected
                             finally:
                                 await http_client.close()
                                 if streaming_error:
-                                    log_streaming_failure("POST /v1/chat/completions (streaming)", streaming_error)
+                                    log_streaming_error("POST /v1/chat/completions (streaming)", streaming_error)
                                 elif client_disconnected:
                                     logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - client disconnected")
                                 else:
                                     logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - completed")
                                 if debug_logger:
                                     if streaming_error:
-                                        debug_logger.flush_on_error(500, str(streaming_error))
+                                        debug_logger.flush_on_error(getattr(streaming_error, "status_code", 500), str(streaming_error))
                                     else:
                                         debug_logger.discard_buffers()
                         
@@ -698,18 +749,18 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
                 except Exception as e:
                     streaming_error = e
-                    # Try to send [DONE] to client before finishing
-                    # so client doesn't "hang" waiting for data
+                    # Headers are already sent - report the error in-band and end the
+                    # generator normally so Starlette never sees a post-header raise
                     try:
+                        yield build_sse_error_chunk(e)
                         yield "data: [DONE]\n\n"
                     except Exception:
                         pass  # Client already disconnected
-                    raise
                 finally:
                     await http_client.close()
                     # Log access log for streaming (success or error)
                     if streaming_error:
-                        log_streaming_failure("POST /v1/chat/completions (streaming)", streaming_error)
+                        log_streaming_error("POST /v1/chat/completions (streaming)", streaming_error)
                     elif client_disconnected:
                         logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - client disconnected")
                     else:
@@ -717,7 +768,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     # Write debug logs AFTER streaming completes
                     if debug_logger:
                         if streaming_error:
-                            debug_logger.flush_on_error(500, str(streaming_error))
+                            debug_logger.flush_on_error(getattr(streaming_error, "status_code", 500), str(streaming_error))
                         else:
                             debug_logger.discard_buffers()
             

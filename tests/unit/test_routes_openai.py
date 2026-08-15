@@ -1998,3 +1998,335 @@ class TestChatCompletionsLegacyMode:
         
         assert failover_enabled is False
         print("✅ Legacy mode correctly skips failover loop")
+
+
+
+# =============================================================================
+# Tests for in-band reporting of streaming errors raised after headers (PR #268)
+# =============================================================================
+
+class TestBuildSseErrorChunk:
+    """
+    Tests for build_sse_error_chunk() - OpenAI-shaped in-band streaming error.
+
+    Once StreamingResponse has sent headers the status code cannot change, so the
+    reason must travel inside the SSE body or the client sees a silent empty answer.
+    """
+
+    def test_http_exception_preserves_status_and_detail(self):
+        """
+        What it does: Verifies HTTPException status_code/detail reach the chunk.
+        Purpose: The real 504 first-token timeout reason must reach the client.
+        """
+        print("Setup: HTTPException(504)...")
+        from kiro.routes_openai import build_sse_error_chunk
+
+        chunk = build_sse_error_chunk(HTTPException(
+            status_code=504,
+            detail="Model did not respond within 15.0s after 3 attempts."
+        ))
+
+        print(f"Chunk: {chunk!r}")
+        assert chunk.startswith("data: ")
+        assert chunk.endswith("\n\n")
+        payload = json.loads(chunk[len("data: "):])
+        assert payload["error"]["code"] == 504
+        assert payload["error"]["message"] == "Model did not respond within 15.0s after 3 attempts."
+        assert payload["error"]["type"] == "kiro_api_error"
+        print("✅ Status and detail preserved in-band")
+
+    def test_generic_exception_reported_as_500(self):
+        """
+        What it does: Verifies a non-HTTP exception yields code 500 with its message.
+        Purpose: Unexpected failures must still produce a valid error chunk.
+        """
+        print("Setup: RuntimeError...")
+        from kiro.routes_openai import build_sse_error_chunk
+
+        payload = json.loads(build_sse_error_chunk(RuntimeError("connection dropped"))[len("data: "):])
+        print(f"Payload: {payload}")
+        assert payload["error"]["code"] == 500
+        assert payload["error"]["message"] == "connection dropped"
+        print("✅ Generic exception reported as 500")
+
+    def test_empty_message_falls_back_to_type_name(self):
+        """
+        What it does: Verifies an exception with no message still gets a message.
+        Purpose: Avoid an empty reason, which is the bug being fixed.
+        """
+        from kiro.routes_openai import build_sse_error_chunk
+        payload = json.loads(build_sse_error_chunk(RuntimeError())[len("data: "):])
+        print(f"Payload: {payload}")
+        assert payload["error"]["message"] == "RuntimeError"
+        print("✅ Falls back to exception type name")
+
+
+class TestLogStreamingError:
+    """Tests for log_streaming_error() status accuracy."""
+
+    def test_http_exception_logged_with_its_own_status(self):
+        """
+        What it does: Verifies an HTTPException(504) is not logged as HTTP 500.
+        Purpose: A 504 upstream timeout must not look like a gateway bug.
+        """
+        print("Setup: capturing loguru output...")
+        from loguru import logger as loguru_logger
+        from kiro.routes_openai import log_streaming_error
+
+        records = []
+        sink_id = loguru_logger.add(lambda m: records.append(m), level="DEBUG")
+        try:
+            log_streaming_error(
+                "POST /v1/chat/completions (streaming)",
+                HTTPException(status_code=504, detail="Model did not respond within 15.0s")
+            )
+        finally:
+            loguru_logger.remove(sink_id)
+
+        text = "".join(records)
+        print(f"Logged: {text.strip()}")
+        assert "HTTP 504" in text
+        assert "HTTP 500" not in text
+        assert "Model did not respond" in text
+        print("✅ HTTPException logged at its real status")
+
+    def test_generic_exception_delegates_to_shared_helper(self):
+        """
+        What it does: Verifies non-HTTPException errors go through log_streaming_failure.
+        Purpose: Keep transport-drop classification in one place.
+        """
+        from kiro.routes_openai import log_streaming_error
+        with patch('kiro.routes_openai.log_streaming_failure') as mock_log:
+            err = RuntimeError("boom")
+            log_streaming_error("POST /v1/chat/completions (streaming)", err)
+        mock_log.assert_called_once_with("POST /v1/chat/completions (streaming)", err)
+        print("✅ Delegates to shared classifier")
+
+
+class TestStreamingErrorAfterResponseStart:
+    """
+    End-to-end tests: a streaming failure after headers must be reported in-band.
+
+    Before this fix the route re-raised after StreamingResponse had started, so
+    Starlette failed with "Caught handled exception, but response already started",
+    the connection was aborted and the client saw only `data: [DONE]`.
+    """
+
+    def _mock_http_client(self, mock_class):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        instance = AsyncMock()
+        instance.request_with_retry = AsyncMock(return_value=mock_response)
+        instance.close = AsyncMock()
+        instance.client = MagicMock()
+        mock_class.return_value = instance
+        return instance
+
+    @patch('kiro.routes_openai.stream_with_first_token_retry')
+    @patch('kiro.routes_openai.KiroHttpClient')
+    def test_http_exception_504_surfaces_in_band_then_done(
+        self, mock_kiro_http_client_class, mock_stream, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies a 504 from the streaming pipeline becomes an SSE error chunk.
+        Purpose: Client must learn the reason instead of getting a silent empty answer.
+        """
+        print("Setup: upstream 200, stream raises HTTPException(504)...")
+        self._mock_http_client(mock_kiro_http_client_class)
+
+        async def failing_stream(*args, **kwargs):
+            raise HTTPException(
+                status_code=504,
+                detail="Model did not respond within 15.0s after 3 attempts. Please try again."
+            )
+            yield ""  # pragma: no cover - makes this an async generator
+
+        mock_stream.side_effect = failing_stream
+
+        print("Action: POST /v1/chat/completions with stream=true...")
+        response = test_client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True
+            }
+        )
+
+        body = response.text
+        print(f"Checking: status={response.status_code}, body={body[:200]!r}")
+        assert response.status_code == 200, "Headers already sent - status stays 200"
+        assert '"error"' in body, "Error must be reported in-band"
+        assert "Model did not respond" in body, "Real detail must reach the client"
+        assert "504" in body, "Real status must reach the client"
+        error_line = [l for l in body.splitlines() if l.startswith("data: ") and '"error"' in l][0]
+        payload = json.loads(error_line[len("data: "):])
+        assert payload["error"]["code"] == 504
+        assert body.index(error_line) < body.index("data: [DONE]"), \
+            "Error chunk must precede [DONE]"
+        assert body.rstrip().endswith("data: [DONE]")
+        print("✅ 504 delivered in-band, error before [DONE], no ASGI abort")
+
+    @patch('kiro.routes_openai.stream_with_first_token_retry')
+    @patch('kiro.routes_openai.KiroHttpClient')
+    def test_generic_failure_after_first_chunk_ends_stream_gracefully(
+        self, mock_kiro_http_client_class, mock_stream, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies a mid-stream failure yields content, then error, then [DONE].
+        Purpose: No exception may escape the generator once headers are sent.
+        """
+        print("Setup: stream yields one chunk then raises...")
+        self._mock_http_client(mock_kiro_http_client_class)
+
+        async def failing_stream(*args, **kwargs):
+            yield 'data: {"id":"chatcmpl-1"}\n\n'
+            raise RuntimeError("upstream exploded")
+
+        mock_stream.side_effect = failing_stream
+
+        response = test_client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True
+            }
+        )
+
+        body = response.text
+        print(f"Checking: body={body[:200]!r}")
+        assert response.status_code == 200
+        assert "chatcmpl-1" in body, "Content emitted before the failure is preserved"
+        assert "upstream exploded" in body, "Reason must be reported in-band"
+        assert body.rstrip().endswith("data: [DONE]")
+        print("✅ Generator completed without raising (ASGI symptom gone)")
+
+    @patch('kiro.routes_openai.stream_with_first_token_retry')
+    @patch('kiro.routes_openai.KiroHttpClient')
+    def test_success_path_is_unchanged(
+        self, mock_kiro_http_client_class, mock_stream, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies a successful stream body is byte-identical to the input chunks.
+        Purpose: Regression guard - no error chunk may be added on the happy path.
+        """
+        print("Setup: stream yields two chunks and [DONE]...")
+        self._mock_http_client(mock_kiro_http_client_class)
+
+        chunks = ['data: {"id":"a"}\n\n', 'data: {"id":"b"}\n\n', 'data: [DONE]\n\n']
+
+        async def ok_stream(*args, **kwargs):
+            for c in chunks:
+                yield c
+
+        mock_stream.side_effect = ok_stream
+
+        response = test_client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True
+            }
+        )
+
+        print(f"Checking: body={response.text!r}")
+        assert response.text == "".join(chunks), "Success path must be byte-identical"
+        assert '"error"' not in response.text
+        print("✅ Success path unchanged")
+
+    @patch('kiro.routes_openai.stream_with_first_token_retry')
+    @patch('kiro.routes_openai.KiroHttpClient')
+    def test_client_disconnect_generator_exit_unchanged(
+        self, mock_kiro_http_client_class, mock_stream, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies GeneratorExit (client disconnect) emits no error chunk.
+        Purpose: Disconnect handling must stay exactly as before.
+        """
+        print("Setup: stream raises GeneratorExit after one chunk...")
+        instance = self._mock_http_client(mock_kiro_http_client_class)
+
+        async def disconnecting_stream(*args, **kwargs):
+            yield 'data: {"id":"a"}\n\n'
+            raise GeneratorExit()
+
+        mock_stream.side_effect = disconnecting_stream
+
+        response = test_client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True
+            }
+        )
+
+        print(f"Checking: body={response.text!r}")
+        assert response.text == 'data: {"id":"a"}\n\n', "No error chunk, no [DONE] added"
+        instance.close.assert_awaited()
+        print("✅ GeneratorExit behaviour unchanged")
+
+
+    @patch('kiro.routes_openai.stream_with_first_token_retry')
+    @patch('kiro.routes_openai.KiroHttpClient')
+    def test_account_system_path_also_reports_in_band(
+        self, mock_kiro_http_client_class, mock_stream, test_client, clean_app, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies the ACCOUNT_SYSTEM=true stream_wrapper reports in-band too.
+        Purpose: Both stream_wrapper sites in routes_openai.py must behave identically.
+        """
+        print("Setup: enabling account system with a mocked account...")
+        self._mock_http_client(mock_kiro_http_client_class)
+
+        account = Mock()
+        account.id = "/tmp/account1.json"
+        account.auth_manager = Mock()
+        account.auth_manager.profile_arn = "arn:test"
+        account.auth_manager.api_host = "https://example.invalid"
+        account.model_cache = Mock()
+        account.model_resolver = Mock()
+
+        manager = Mock()
+        manager._accounts = {account.id: account}
+        manager.get_next_account = AsyncMock(return_value=account)
+        manager.report_success = AsyncMock()
+        manager.report_failure = AsyncMock()
+
+        async def failing_stream(*args, **kwargs):
+            raise HTTPException(status_code=504, detail="Model did not respond within 15.0s")
+            yield ""  # pragma: no cover - makes this an async generator
+
+        mock_stream.side_effect = failing_stream
+
+        prev_system = clean_app.state.account_system
+        prev_manager = getattr(clean_app.state, "account_manager", None)
+        clean_app.state.account_system = True
+        clean_app.state.account_manager = manager
+        try:
+            response = test_client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+                json={
+                    "model": "claude-sonnet-4-5",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": True
+                }
+            )
+        finally:
+            clean_app.state.account_system = prev_system
+            clean_app.state.account_manager = prev_manager
+
+        body = response.text
+        print(f"Checking: body={body[:200]!r}")
+        assert response.status_code == 200
+        assert "Model did not respond" in body
+        assert '"code": 504' in body
+        assert body.rstrip().endswith("data: [DONE]")
+        print("✅ Account-system stream_wrapper reports in-band as well")
