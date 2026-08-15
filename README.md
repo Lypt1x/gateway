@@ -233,21 +233,30 @@ API-key auth, so `grok login` is not needed.
 
 ```bash
 export KIRO_GATEWAY_KEY=pick-your-own-secret
+export XAI_API_KEY="$KIRO_GATEWAY_KEY"
 
 python grok-build/grok_build_config.py setup --url http://localhost:8000 --write
 grok -p "Explain this repo"
 ```
+
+> [!IMPORTANT]
+> Grok Build reads the key from the **environment**; it has no file-reference syntax. Both
+> variables are needed: the per-model `env_key` covers inference, while `XAI_API_KEY`
+> authenticates the model-list fetch. Without them Grok falls back to its grok.com login and
+> sends an xAI token, which the gateway rejects with 401 — the symptom is a login prompt
+> followed by every model failing. Put both in your shell profile so interactive `grok` sessions
+> inherit them, and run `doctor`, which checks for them explicitly.
 
 That merges the gateway's sections into `~/.grok/config.toml`: an `[endpoints] models_base_url`
 pointing at the gateway, and a `[model."<id>"]` table per model with its real context window.
 `setup`, `doctor` and `update` behave the same as the OpenCode helper, including the dry-run
 default and `--write` backups, and only the sections the gateway owns are rewritten.
 
-> [!IMPORTANT]
-> Grok Build uses separate models for auxiliary work: session titles, image descriptions and web
-> search. If those are left unset it falls back to its own xAI model, and every session fires a
-> request that the gateway cannot serve. The generated config pins all of them, choosing the
-> cheapest available model by rate multiplier for throwaway work like session titles.
+> [!NOTE]
+> Grok Build uses separate models for auxiliary work: session titles, prompt suggestions, image
+> descriptions and web search. Left unset, each falls back to its own xAI model and every session
+> fires a request the gateway cannot serve. The generated config pins all of them, choosing the
+> cheapest available model by rate multiplier for throwaway work.
 
 Check what Grok actually resolved with `grok models` and `grok inspect`.
 
